@@ -29,6 +29,9 @@
 #ifdef USE_NUMBER
 #include "esphome/components/number/number.h"
 #endif
+#ifdef USE_TEXT
+#include "esphome/components/text/text.h"
+#endif
 #ifdef USE_SELECT
 #include "esphome/components/select/select.h"
 #endif
@@ -94,11 +97,14 @@ class NukiLockComponent :
     SUB_SENSOR(battery_voltage)
     SUB_SENSOR(battery_drain)
     SUB_SENSOR(motor_current)
+    SUB_SENSOR(lock_distance)
     SUB_SENSOR(bt_signal)
     SUB_SENSOR(wifi_connection_strength)
     #endif
     #ifdef USE_TEXT_SENSOR
+    SUB_TEXT_SENSOR(bluetooth_status)
     SUB_TEXT_SENSOR(door_sensor_state)
+    SUB_TEXT_SENSOR(lock_state)
     SUB_TEXT_SENSOR(last_unlock_user)
     SUB_TEXT_SENSOR(last_lock_action)
     SUB_TEXT_SENSOR(last_lock_action_trigger)
@@ -117,6 +123,12 @@ class NukiLockComponent :
     SUB_NUMBER(locked_position_offset)
     SUB_NUMBER(single_locked_position_offset)
     SUB_NUMBER(unlocked_to_locked_transition_offset)
+    #endif
+    #ifdef USE_TEXT
+    protected:
+        text::Text *security_pin_text_{nullptr};
+    public:
+        void set_security_pin_text(text::Text *t) { this->security_pin_text_ = t; }
     #endif
     #ifdef USE_SELECT
     SUB_SELECT(single_button_press_action)
@@ -208,6 +220,7 @@ class NukiLockComponent :
             }
         }
         void set_security_pin(uint32_t security_pin);
+        void publish_security_pin();
         void set_pairing_mode(bool enabled);
 
 #ifdef USE_NUKI_LOCK_HYBRID
@@ -252,6 +265,8 @@ class NukiLockComponent :
 
         bool is_connected() { return this->connected_; }
         bool is_paired() { return this->nuki_lock_.is_paired_with_lock(); }
+        std::string get_bluetooth_status();
+        void publish_bluetooth_status();
 
         void lock_n_go();
         void print_keypad_entries();
@@ -356,6 +371,7 @@ class NukiLockComponent :
         // executing_lock_action_, for the same reason - see set_lock_action_options().
         uint8_t executing_lock_action_flags_{0};
         std::string executing_lock_action_name_suffix_;
+        std::string last_published_bt_status_{};
 
         // Publishes the transitional lock state assumed while a lock action is executing
         void publish_assumed_lock_state(LockAction action);
@@ -732,6 +748,16 @@ class NukiLockLoggingEnabledSwitch : public switch_::Switch, public Parented<Nuk
 
     protected:
         void write_state(bool state) override;
+};
+#endif
+
+#ifdef USE_TEXT
+class NukiLockSecurityPinText : public text::Text, public Parented<NukiLockComponent> {
+    public:
+        NukiLockSecurityPinText() = default;
+
+    protected:
+        void control(const std::string &value) override;
 };
 #endif
 

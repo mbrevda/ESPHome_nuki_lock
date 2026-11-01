@@ -6,7 +6,7 @@ import esphome.config_validation as cv
 from esphome import automation
 from esphome.components.esp32 import add_idf_component, add_idf_sdkconfig_option, arduino_bundles_libsodium
 from esphome.components.noise import LIBSODIUM_VERSION
-from esphome.components import esp32_ble, esp32_ble_tracker, lock, binary_sensor, text_sensor, sensor, switch, button, number, select
+from esphome.components import esp32_ble, esp32_ble_tracker, lock, binary_sensor, text_sensor, sensor, switch, button, number, select, text
 from esphome.components.esp32_ble import BTLoggers
 from esphome.const import (
     CONF_ID,
@@ -37,7 +37,7 @@ DEPENDENCIES = ["esp32_ble_tracker"]
 
 # ESP-IDF component compiling the libsodium modules ESPHome's port leaves out
 NUKI_SODIUM_DIR = Path(__file__).resolve().parent / "nuki_sodium"
-AUTO_LOAD = ["binary_sensor", "text_sensor", "sensor", "switch", "button", "number", "select", "esp32_ble_client"]
+AUTO_LOAD = ["binary_sensor", "text_sensor", "sensor", "switch", "button", "number", "select", "text", "esp32_ble_client"]
 
 CONF_CONNECTED_BINARY_SENSOR = "connected"
 CONF_PAIRED_BINARY_SENSOR = "paired"
@@ -53,9 +53,12 @@ CONF_BATTERY_VOLTAGE_SENSOR = "battery_voltage"
 CONF_BATTERY_DRAIN_SENSOR = "battery_drain"
 CONF_MOTOR_CURRENT_SENSOR = "motor_current"
 CONF_BT_SIGNAL_SENSOR = "bt_signal_strength"
+CONF_BLUETOOTH_STATUS_TEXT_SENSOR = "bluetooth_status"
 CONF_WIFI_CONNECTION_STRENGTH_SENSOR = "wifi_connection_strength"
 
 CONF_DOOR_SENSOR_STATE_TEXT_SENSOR = "door_sensor_state"
+CONF_LOCK_STATE_TEXT_SENSOR = "lock_state"
+CONF_LOCK_DISTANCE_SENSOR = "lock_distance"
 CONF_LAST_UNLOCK_USER_TEXT_SENSOR = "last_unlock_user"
 CONF_LAST_LOCK_ACTION_TEXT_SENSOR = "last_lock_action"
 CONF_LAST_LOCK_ACTION_TRIGGER_TEXT_SENSOR = "last_lock_action_trigger"
@@ -97,6 +100,7 @@ CONF_ADVERTISING_MODE_SELECT = "advertising_mode"
 CONF_BATTERY_TYPE_SELECT = "battery_type"
 CONF_MOTOR_SPEED_SELECT = "motor_speed"
 
+CONF_SECURITY_PIN_TEXT = "security_pin_text"
 CONF_LED_BRIGHTNESS_NUMBER = "led_brightness"
 CONF_TIMEZONE_OFFSET_NUMBER = "timezone_offset"
 CONF_LOCK_N_GO_TIMEOUT_NUMBER = "lock_n_go_timeout"
@@ -256,6 +260,7 @@ NukiLockDetachedCylinderEnabledSwitch = nuki_lock_ns.class_("NukiLockDetachedCyl
 NukiLockLoggingEnabledSwitch = nuki_lock_ns.class_("NukiLockLoggingEnabledSwitch", switch.Switch, cg.Component)
 
 # Number Inputs
+NukiLockSecurityPinText = nuki_lock_ns.class_("NukiLockSecurityPinText", text.Text, cg.Component)
 NukiLockLedBrightnessNumber = nuki_lock_ns.class_("NukiLockLedBrightnessNumber", number.Number, cg.Component)
 NukiLockTimeZoneOffsetNumber = nuki_lock_ns.class_("NukiLockTimeZoneOffsetNumber", number.Number, cg.Component)
 NukiLockLockNGoTimeoutNumber = nuki_lock_ns.class_("NukiLockLockNGoTimeoutNumber", number.Number, cg.Component)
@@ -377,6 +382,13 @@ CONFIG_SCHEMA = cv.All(
                 entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
                 icon="mdi:door-open",
             ),
+            cv.Optional(CONF_LOCK_STATE_TEXT_SENSOR): text_sensor.text_sensor_schema(
+                icon="mdi:lock-question",
+            ),
+            cv.Optional(CONF_BLUETOOTH_STATUS_TEXT_SENSOR): text_sensor.text_sensor_schema(
+                entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+                icon="mdi:bluetooth-connect",
+            ),
             cv.Optional(CONF_LAST_UNLOCK_USER_TEXT_SENSOR):  text_sensor.text_sensor_schema(
                 entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
                 icon="mdi:account-clock"
@@ -427,6 +439,11 @@ CONFIG_SCHEMA = cv.All(
                 entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
                 unit_of_measurement="mWs",
                 icon="mdi:battery-arrow-down-outline",
+            ),
+            cv.Optional(CONF_LOCK_DISTANCE_SENSOR): sensor.sensor_schema(
+                entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+                unit_of_measurement=UNIT_DEGREES,
+                icon="mdi:rotate-right",
             ),
             cv.Optional(CONF_MOTOR_CURRENT_SENSOR): sensor.sensor_schema(
                 device_class=DEVICE_CLASS_CURRENT,
@@ -572,6 +589,12 @@ CONFIG_SCHEMA = cv.All(
                 device_class=DEVICE_CLASS_SWITCH,
                 entity_category=ENTITY_CATEGORY_CONFIG,
                 icon="mdi:math-log",
+            ),
+            cv.Optional(CONF_SECURITY_PIN_TEXT): text.text_schema(
+                NukiLockSecurityPinText,
+                entity_category=ENTITY_CATEGORY_CONFIG,
+                icon="mdi:shield-key",
+                mode="PASSWORD",
             ),
             cv.Optional(CONF_LED_BRIGHTNESS_NUMBER): number.number_schema(
                 NukiLockLedBrightnessNumber,
@@ -920,6 +943,10 @@ async def to_code(config):
         sens = await sensor.new_sensor(battery_drain)
         cg.add(var.set_battery_drain_sensor(sens))
 
+    if lock_distance := config.get(CONF_LOCK_DISTANCE_SENSOR):
+        sens = await sensor.new_sensor(lock_distance)
+        cg.add(var.set_lock_distance_sensor(sens))
+
     if motor_current := config.get(CONF_MOTOR_CURRENT_SENSOR):
         sens = await sensor.new_sensor(motor_current)
         cg.add(var.set_motor_current_sensor(sens))
@@ -933,9 +960,17 @@ async def to_code(config):
         cg.add(var.set_wifi_connection_strength_sensor(sens))
 
     # Text Sensor
+    if bluetooth_status := config.get(CONF_BLUETOOTH_STATUS_TEXT_SENSOR):
+        sens = await text_sensor.new_text_sensor(bluetooth_status)
+        cg.add(var.set_bluetooth_status_text_sensor(sens))
+
     if door_sensor_state := config.get(CONF_DOOR_SENSOR_STATE_TEXT_SENSOR):
         sens = await text_sensor.new_text_sensor(door_sensor_state)
         cg.add(var.set_door_sensor_state_text_sensor(sens))
+
+    if lock_state := config.get(CONF_LOCK_STATE_TEXT_SENSOR):
+        sens = await text_sensor.new_text_sensor(lock_state)
+        cg.add(var.set_lock_state_text_sensor(sens))
 
     if last_unlock_user := config.get(CONF_LAST_UNLOCK_USER_TEXT_SENSOR):
         sens = await text_sensor.new_text_sensor(last_unlock_user)
@@ -977,6 +1012,11 @@ async def to_code(config):
         cg.add(var.set_request_calibration_button(b))
 
     # Number
+    if security_pin_text := config.get(CONF_SECURITY_PIN_TEXT):
+        t = await text.new_text(security_pin_text, min_length=0, max_length=6, pattern="[0-9]*")
+        await cg.register_parented(t, config[CONF_ID])
+        cg.add(var.set_security_pin_text(t))
+
     if led_brightness := config.get(CONF_LED_BRIGHTNESS_NUMBER):
         n = await number.new_number(
             led_brightness, min_value=0, max_value=5, step=1
@@ -1007,7 +1047,7 @@ async def to_code(config):
 
     if unlatch_duration := config.get(CONF_UNLATCH_DURATION_NUMBER):
         n = await number.new_number(
-            unlatch_duration, min_value=5, max_value=60, step=1
+            unlatch_duration, min_value=1, max_value=30, step=1
         )
         await cg.register_parented(n, config[CONF_ID])
         cg.add(var.set_unlatch_duration_number(n))

@@ -70,6 +70,16 @@ void NukiLockComponent::process_key_turner_state() {
     }
     #endif
 
+    #ifdef USE_SENSOR
+    // The battery report carries the last action's travel; fetch it once the motor stops.
+    bool was_moving = this->last_lock_state_ == LockState::Locking || this->last_lock_state_ == LockState::Unlocking ||
+                      this->last_lock_state_ == LockState::Unlatching || this->last_lock_state_ == LockState::Unlatched;
+    bool moving = current_lock_state == LockState::Locking || current_lock_state == LockState::Unlocking ||
+                  current_lock_state == LockState::Unlatching || current_lock_state == LockState::Unlatched;
+    if (this->lock_distance_sensor_ != nullptr && was_moving && !moving) {
+        this->battery_report_update_ = true;
+    }
+    #endif
     this->last_lock_state_ = current_lock_state;
 
     #ifdef USE_BINARY_SENSOR
@@ -149,6 +159,10 @@ void NukiLockComponent::process_key_turner_state() {
     }
     #endif
     #ifdef USE_TEXT_SENSOR
+    if (this->lock_state_text_sensor_ != nullptr) {
+        this->lock_state_text_sensor_->publish_state(current_lock_state_as_string);
+    }
+
     if (this->door_sensor_state_text_sensor_ != nullptr){
         memset(str, 0, sizeof(str));
         door_sensor_state_to_string(this->retrieved_key_turner_state_.doorSensorState, str);
@@ -575,6 +589,10 @@ void NukiLockComponent::update_battery_report() {
 
         if (this->motor_current_sensor_ != nullptr) {
             this->motor_current_sensor_->publish_state(this->battery_report_.maxTurnCurrent);
+        }
+
+        if (this->lock_distance_sensor_ != nullptr) {
+            this->lock_distance_sensor_->publish_state(this->battery_report_.lockDistance);
         }
         #endif
     } else {
@@ -1033,8 +1051,20 @@ void NukiLockComponent::execute_lock_action_step() {
     this->command_cooldown_millis = is_execution_successful ? COOLDOWN_COMMANDS_MILLIS : this->command_retry_delay_millis_;
 }
 
+// The PIN is never published: the entity shows a mask when one is set, empty otherwise.
+static const char *const SECURITY_PIN_MASK = "******";
+
+void NukiLockComponent::publish_security_pin() {
+    #ifdef USE_TEXT
+    if (this->security_pin_text_ != nullptr) {
+        bool set = this->security_pin_ != 0 || this->security_pin_config_.value_or(0) != 0;
+        this->security_pin_text_->publish_state(set ? SECURITY_PIN_MASK : "");
+    }
+    #endif
+}
+
 void NukiLockComponent::set_security_pin(uint32_t new_pin) {
-    ESP_LOGI(TAG, "Setting security pin: %" PRIu32, new_pin);
+    ESP_LOGI(TAG, "Setting security pin");
 
     if (new_pin > 999999) {
         ESP_LOGE(TAG, "Invalid pin: %" PRIu32 " (max. 6 digits/999999) - abort.", new_pin);
@@ -1046,6 +1076,8 @@ void NukiLockComponent::set_security_pin(uint32_t new_pin) {
         ESP_LOGI(TAG, "Clearing security pin override");
     }
     this->security_pin_ = new_pin;
+
+    this->publish_security_pin();
 
     const uint32_t pin_to_use = this->security_pin_ != 0 ? this->security_pin_ : this->security_pin_config_.value_or(0);
 
@@ -1206,6 +1238,7 @@ void NukiLockComponent::loop()
     }
     this->last_loop_time_ = current_time;
 
+    this->publish_bluetooth_status();
     this->publish_lock_reachable();
 
     // Advertisements are now scanned by esp32_ble_tracker (configured by the user's own
@@ -1422,10 +1455,10 @@ void NukiLockComponent::setup() {
     uint32_t pin_to_use = 0;
     if (this->security_pin_ != 0) {
         ESP_LOGW(TAG, "Note: Using security pin override, not yaml config pin!");
-        ESP_LOGD(TAG, "Security pin: %" PRIu32 " (override)", this->security_pin_);
+        ESP_LOGD(TAG, "Security pin: override");
         pin_to_use = this->security_pin_;
     } else if(this->security_pin_config_.value_or(0) != 0) {
-        ESP_LOGD(TAG, "Security pin: %" PRIu32 " (yaml config)", this->security_pin_config_.value_or(0));
+        ESP_LOGD(TAG, "Security pin: yaml config");
         pin_to_use = this->security_pin_config_.value_or(0);
     } else {
         this->pin_state_ = PinState::NotSet;
@@ -1438,10 +1471,13 @@ void NukiLockComponent::setup() {
             this->pin_state_ = PinState::Invalid;
             this->save_settings();
         } else {
-            ESP_LOGD(TAG, "Set security pin before init: %" PRIu32, pin_to_use);
+            ESP_LOGD(TAG, "Set security pin before init");
+            this->nuki_lock_.save_security_pincode(static_cast<uint16_t>(pin_to_use));
             this->nuki_lock_.save_ultra_pincode((unsigned int)pin_to_use, false);
         }
     }
+
+    this->publish_security_pin();
 
     this->nuki_lock_.set_debug_connect(this->debug_connect_);
     this->nuki_lock_.set_debug_communication(this->debug_communication_);
@@ -1740,7 +1776,9 @@ void NukiLockComponent::dump_config() {
     #endif
     #endif
     #ifdef USE_TEXT_SENSOR
+    LOG_TEXT_SENSOR(TAG, "Bluetooth Status", this->bluetooth_status_text_sensor_);
     LOG_TEXT_SENSOR(TAG, "Door Sensor State", this->door_sensor_state_text_sensor_);
+    LOG_TEXT_SENSOR(TAG, "Lock State", this->lock_state_text_sensor_);
     LOG_TEXT_SENSOR(TAG, "Last Unlock User", this->last_unlock_user_text_sensor_);
     LOG_TEXT_SENSOR(TAG, "Last Lock Action", this->last_lock_action_text_sensor_);
     LOG_TEXT_SENSOR(TAG, "Last Lock Action Trigger", this->last_lock_action_trigger_text_sensor_);
@@ -1754,6 +1792,7 @@ void NukiLockComponent::dump_config() {
     LOG_SENSOR(TAG, "Battery Voltage", this->battery_voltage_sensor_);
     LOG_SENSOR(TAG, "Battery Drain", this->battery_drain_sensor_);
     LOG_SENSOR(TAG, "Motor Current", this->motor_current_sensor_);
+    LOG_SENSOR(TAG, "Lock Distance", this->lock_distance_sensor_);
     LOG_SENSOR(TAG, "Bluetooth Signal", this->bt_signal_sensor_);
     LOG_SENSOR(TAG, "WiFi Connection Strength", this->wifi_connection_strength_sensor_);
     #endif
@@ -1782,6 +1821,9 @@ void NukiLockComponent::dump_config() {
     LOG_SWITCH(TAG, "Logging Enabled", this->logging_enabled_switch_);
     #endif
     #ifdef USE_NUMBER
+    #ifdef USE_TEXT
+    LOG_TEXT(TAG, "Security PIN", this->security_pin_text_);
+    #endif
     LOG_NUMBER(TAG, "LED Brightness", this->led_brightness_number_);
     LOG_NUMBER(TAG, "Timezone Offset", this->timezone_offset_number_);
     LOG_NUMBER(TAG, "LockNGo Timeout", this->lock_n_go_timeout_number_);
@@ -1815,10 +1857,10 @@ void NukiLockComponent::notify(EventType event_type) {
         // Invalid Pin
         ESP_LOGW(TAG, "Nuki reported an invalid security PIN");
 
-        ESP_LOGD(TAG, "NVS PIN 1st-4th Gen: %d", this->nuki_lock_.get_security_pincode());
-        ESP_LOGD(TAG, "NVS PIN 5th Gen (Ultra / Go / Pro): %" PRIu32, this->nuki_lock_.get_ultra_pincode());
-        ESP_LOGD(TAG, "ESPHome PIN (override): %" PRIu32, this->security_pin_);
-        ESP_LOGD(TAG, "ESPHome PIN (YAML): %" PRIu32, this->security_pin_config_.value_or(0));
+        ESP_LOGD(TAG, "NVS PIN 1st-4th Gen: %s", this->nuki_lock_.get_security_pincode() != 0 ? "set" : "not set");
+        ESP_LOGD(TAG, "NVS PIN 5th Gen (Ultra / Go / Pro): %s", this->nuki_lock_.get_ultra_pincode() != 0 ? "set" : "not set");
+        ESP_LOGD(TAG, "ESPHome PIN (override): %s", this->security_pin_ != 0 ? "set" : "not set");
+        ESP_LOGD(TAG, "ESPHome PIN (YAML): %s", this->security_pin_config_.value_or(0) != 0 ? "set" : "not set");
 
         const uint32_t saved_pin = this->nuki_lock_.is_lock_ultra() ? this->nuki_lock_.get_ultra_pincode() : this->nuki_lock_.get_security_pincode();
         const uint32_t actual_pin = this->security_pin_ != 0 ? this->security_pin_ : this->security_pin_config_.value_or(0);
@@ -1955,10 +1997,10 @@ void NukiLockComponent::set_pairing_mode(bool enabled) {
             ESP_LOGW(TAG, "Note: The security pin is crucial to pair a 5th Gen Smart Lock (Ultra / Go / Pro) but is currently not set.");
         }
 
-        ESP_LOGD(TAG, "NVS PIN 1st-4th Gen: %d", this->nuki_lock_.get_security_pincode());
-        ESP_LOGD(TAG, "NVS PIN 5th Gen (Ultra / Go / Pro): %" PRIu32, this->nuki_lock_.get_ultra_pincode());
-        ESP_LOGD(TAG, "ESPHome PIN (override): %" PRIu32, this->security_pin_);
-        ESP_LOGD(TAG, "ESPHome PIN (YAML): %" PRIu32, this->security_pin_config_.value_or(0));
+        ESP_LOGD(TAG, "NVS PIN 1st-4th Gen: %s", this->nuki_lock_.get_security_pincode() != 0 ? "set" : "not set");
+        ESP_LOGD(TAG, "NVS PIN 5th Gen (Ultra / Go / Pro): %s", this->nuki_lock_.get_ultra_pincode() != 0 ? "set" : "not set");
+        ESP_LOGD(TAG, "ESPHome PIN (override): %s", this->security_pin_ != 0 ? "set" : "not set");
+        ESP_LOGD(TAG, "ESPHome PIN (YAML): %s", this->security_pin_config_.value_or(0) != 0 ? "set" : "not set");
 
         ESP_LOGI(TAG, "Waiting for Nuki to enter pairing mode...");
 
@@ -1971,6 +2013,43 @@ void NukiLockComponent::set_pairing_mode(bool enabled) {
         ESP_LOGI(TAG, "Pairing Mode turned off");
         this->pairing_mode_off_callback_.call();
     }
+    this->publish_bluetooth_status();
+}
+
+std::string NukiLockComponent::get_bluetooth_status() {
+    if (!this->nuki_lock_.is_paired_with_lock()) {
+        if (this->pairing_mode_) {
+            return "pairing";
+        }
+        return "unpaired";
+    }
+    if (this->pairing_mode_) {
+        return "pairing";
+    }
+    if (this->nuki_lock_.connected()) {
+        return "connected";
+    }
+    auto ble_st = this->nuki_lock_.state();
+    if (ble_st == esphome::esp32_ble_tracker::ClientState::CONNECTING ||
+        ble_st == esphome::esp32_ble_tracker::ClientState::DISCOVERED) {
+        return "connecting";
+    }
+    if (this->connected_) {
+        return "idle";
+    }
+    return "disconnected";
+}
+
+void NukiLockComponent::publish_bluetooth_status() {
+#ifdef USE_TEXT_SENSOR
+    if (this->bluetooth_status_text_sensor_ != nullptr) {
+        std::string current_st = this->get_bluetooth_status();
+        if (current_st != this->last_published_bt_status_) {
+            this->last_published_bt_status_ = current_st;
+            this->bluetooth_status_text_sensor_->publish_state(current_st);
+        }
+    }
+#endif
 }
 
 #ifdef USE_BUTTON
@@ -2256,6 +2335,19 @@ void NukiLockLoggingEnabledSwitch::write_state(bool state) {
             this->publish_state(state);
         }
     });
+}
+#endif
+
+#ifdef USE_TEXT
+void NukiLockSecurityPinText::control(const std::string &value) {
+    if (value == SECURITY_PIN_MASK) return;
+    // Empty clears the override, falling back to the YAML pin.
+    if (value.size() > 6 || value.find_first_not_of("0123456789") != std::string::npos) {
+        ESP_LOGW(TAG, "Security PIN must be up to 6 digits");
+        this->parent_->publish_security_pin();
+        return;
+    }
+    this->parent_->set_security_pin(value.empty() ? 0 : static_cast<uint32_t>(std::stoul(value)));
 }
 #endif
 
