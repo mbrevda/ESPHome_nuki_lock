@@ -40,6 +40,7 @@
 #include "nuki_ble_constants.h"
 
 #include "nuki_lock_utils.h"
+#include "nuki_bridge.h"
 
 namespace esphome::nuki_lock {
 
@@ -144,6 +145,8 @@ class NukiLockComponent :
     #ifdef USE_BUTTON
     SUB_BUTTON(unpair)
     SUB_BUTTON(request_calibration)
+    SUB_BUTTON(pair_bridge)
+    SUB_BUTTON(pair_lock)
     #endif
     #ifdef USE_SWITCH
     SUB_SWITCH(pairing_mode)
@@ -284,6 +287,23 @@ class NukiLockComponent :
         NukiLock* get_nuki_lock() { return &this->nuki_lock_; }
         Config* get_nuki_lock_config() { return &this->nuki_lock_config_; }
         AdvancedConfig* get_nuki_lock_advanced_config() { return &this->nuki_lock_advanced_config_; }
+
+        // ── Bridge Integration ──
+        uint32_t get_lock_nuki_id() const { return this->nuki_lock_config_.nukiId; }
+        bool can_relay() const {
+            // Indications are routed by authorization id, so a relay may share the link with
+            // one of our own commands.
+            // ... except a door report: the lock didn't answer either while one hung.
+            return this->nuki_lock_.can_start_relay() && !this->door_report_in_flight_;
+        }
+        bool execute_relay_command(const uint8_t *data, size_t len, std::function<void(bool ok, const uint8_t *resp, size_t resplen)> callback) {
+            return this->nuki_lock_.start_relay(data, len, callback);
+        }
+        void set_bridge(NukiBridge *bridge) { this->bridge_.reset(bridge); }
+        NukiBridge *get_bridge() { return this->bridge_.get(); }
+        void register_bridge() {
+            if (this->bridge_) this->bridge_->start_registration();
+        }
 
         // Queues a Nuki command (typically a `nuki_lock_.setXxx(...)` call) to run on the
         // single in-flight Nuki BLE command slot. `command` is called repeatedly, once per
@@ -474,6 +494,7 @@ class NukiLockComponent :
         uint32_t door_report_failing_since_{0};
         uint32_t nuki_op_started_at_{0};
         LockState last_lock_state_{LockState::Undefined};
+        std::unique_ptr<NukiBridge> bridge_{nullptr};
 
         // Action flags
         bool open_latch_{false};
@@ -532,6 +553,20 @@ class NukiLockUnpairButton : public button::Button, public Parented<NukiLockComp
 class NukiLockRequestCalibrationButton : public button::Button, public Parented<NukiLockComponent> {
     public:
         NukiLockRequestCalibrationButton() = default;
+    protected:
+        void press_action() override;
+};
+
+class NukiLockPairBridgeButton : public button::Button, public Parented<NukiLockComponent> {
+    public:
+        NukiLockPairBridgeButton() = default;
+    protected:
+        void press_action() override;
+};
+
+class NukiLockPairLockButton : public button::Button, public Parented<NukiLockComponent> {
+    public:
+        NukiLockPairLockButton() = default;
     protected:
         void press_action() override;
 };

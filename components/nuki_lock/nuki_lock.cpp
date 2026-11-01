@@ -39,6 +39,9 @@ void NukiLockComponent::process_key_turner_state() {
 
     this->status_update_consecutive_errors_ = 0;
     this->connected_ = true;
+    if (this->bridge_ != nullptr) {
+        this->bridge_->on_lock_reachable();
+    }
 
     LockState current_lock_state = this->retrieved_key_turner_state_.lockState;
     char current_lock_state_as_string[30] = {0};
@@ -368,6 +371,10 @@ void NukiLockComponent::update_config() {
             this->advertising_mode_select_->publish_state(str);
         }
         #endif
+
+        if (this->bridge_ != nullptr && this->nuki_lock_config_.nukiId != 0) {
+            this->bridge_->send_push_nukis_request();
+        }
     } else {
         ESP_LOGE(TAG, "request_config has resulted in %s (%d)", str, conf_req_result);
     }
@@ -684,9 +691,11 @@ void NukiLockComponent::report_door_sensor_step() {
 bool NukiLockComponent::door_report_held(bool open) {
     // CLOSED reports sent while the motor ran went unanswered, so wait for it to stop. OPEN
     // releases the latch and never waits. The lock state can be stale, hence the cap.
+    // After an app command the motor runs while our polls are held back, so the lock state
+    // never shows it; treat a busy relay as moving too.
     static const uint32_t MAX_HOLD_MS = 5000;
     bool moving = this->last_lock_state_ == LockState::Locking || this->last_lock_state_ == LockState::Unlocking ||
-                  this->last_lock_state_ == LockState::Unlatching;
+                  this->last_lock_state_ == LockState::Unlatching || this->nuki_lock_.is_relay_busy();
     if (open || !moving) {
         this->door_report_held_since_ = 0;
         return false;
@@ -1218,6 +1227,10 @@ void NukiLockComponent::loop()
     // Unlike the Nuki-protocol work below, this runs on every single call, not gated to
     // 500ms, since BLE connection state benefits from being processed promptly.
     this->nuki_lock_.loop();
+    if (this->bridge_) {
+        this->bridge_->loop();
+    }
+
 
     // Throttle to every 500ms while idle - there's nothing to gain from running this any
     // faster when there's no operation in flight. But while a Nuki BLE operation is active,
@@ -1289,8 +1302,9 @@ void NukiLockComponent::loop()
             this->nuki_op_step_ = [this] { this->validate_pin_step(); };
             this->nuki_op_step_();
         } else if (bool door_open; this->door_report_due() && this->door_report_next(&door_open) &&
+                   !this->nuki_lock_.relay_in_progress() && !(this->bridge_ && this->bridge_->relay_pending()) &&
                    !this->door_report_held(door_open)) {
-            // Door reports go before our own commands.
+            // Door reports go before our own commands, but after the app's (relayed) ones.
             ESP_LOGD(TAG, "Reporting door sensor state...");
             this->door_report_retry_at_ = 0;
             this->door_sensor_report_sending_open_ = door_open;
@@ -1309,6 +1323,8 @@ void NukiLockComponent::loop()
             this->nuki_op_step_();
             // command_cooldown_millis is set by process_pending_nuki_command() itself -
             // it differs between success, a retry-after-failure, and exhausted retries.
+        } else if (this->nuki_lock_.is_relay_busy()) {
+            // The app is talking to the lock through the cloud; polls wait until it is done.
         } else if (this->status_update_) {
             ESP_LOGD(TAG, "Requesting status...");
             this->nuki_op_active_ = true;
@@ -1381,6 +1397,12 @@ void NukiLockComponent::loop()
             // Pair Nuki (pair_nuki() performs one step per call and reports progress via
             // its return value, so this does not block loop() while pairing is ongoing)
             AuthorizationIdType type = this->pairing_as_app_.value_or(false) ? AuthorizationIdType::App : AuthorizationIdType::Bridge;
+            if (type == AuthorizationIdType::Bridge && this->bridge_ != nullptr && this->bridge_->get_bridge_id() != 0) {
+                // Pair as the cloud bridge itself, named like a Bridge v2 ("Nuki_Bridge_%08X").
+                char name[24];
+                snprintf(name, sizeof(name), "Nuki_Bridge_%08" PRIX32, this->bridge_->get_bridge_id());
+                this->nuki_lock_.set_pairing_identity(this->bridge_->get_bridge_id(), name);
+            }
 
             App.feed_wdt();
 
@@ -1572,6 +1594,10 @@ void NukiLockComponent::setup() {
             this->paired_binary_sensor_->publish_state(false);
         }
         #endif
+    }
+
+    if (this->bridge_) {
+        this->bridge_->setup();
     }
 }
 
@@ -1799,6 +1825,8 @@ void NukiLockComponent::dump_config() {
     #ifdef USE_BUTTON
     LOG_BUTTON(TAG, "Unpair", this->unpair_button_);
     LOG_BUTTON(TAG, "Request Calibration", this->request_calibration_button_);
+    LOG_BUTTON(TAG, "Pair Bridge", this->pair_bridge_button_);
+    LOG_BUTTON(TAG, "Pair Lock", this->pair_lock_button_);
     #endif
     #ifdef USE_SWITCH
     LOG_SWITCH(TAG, "Pairing Mode", this->pairing_mode_switch_);
@@ -1845,6 +1873,10 @@ void NukiLockComponent::dump_config() {
     LOG_SELECT(TAG, "Battery Type", this->battery_type_select_);
     LOG_SELECT(TAG, "Motor Speed", this->motor_speed_select_);
     #endif
+
+    if (this->bridge_) {
+        this->bridge_->dump_config();
+    }
 }
 
 void NukiLockComponent::notify(EventType event_type) {
@@ -1881,6 +1913,9 @@ void NukiLockComponent::notify(EventType event_type) {
             this->door_report_retry_at_ = millis() | 1;
         }
 #endif
+        if (this->bridge_) {
+            this->bridge_->send_keyturner_event();
+        }
 
         if ((int32_t)(millis() - this->ignore_status_beacon_until_) < 0) {
             // Flags the state change of our own lock action, already published from the
@@ -2059,6 +2094,19 @@ void NukiLockUnpairButton::press_action() {
 
 void NukiLockRequestCalibrationButton::press_action() {
     this->parent_->request_calibration();
+}
+
+void NukiLockPairBridgeButton::press_action() {
+    this->parent_->register_bridge();
+}
+
+void NukiLockPairLockButton::press_action() {
+    ESP_LOGI(TAG, "Pair Lock button pressed - activating lock pairing mode");
+    // Re-pairing replaces the current pairing, so there is no separate unpair step.
+    if (this->parent_->is_paired()) {
+        this->parent_->unpair();
+    }
+    this->parent_->set_pairing_mode(true);
 }
 #endif
 

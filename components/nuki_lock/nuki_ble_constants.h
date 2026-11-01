@@ -20,6 +20,7 @@ const char BLE_ADDRESS_STORE_NAME[]      = "bleAddress";
 const char SECURITY_PINCODE_STORE_NAME[] = "securityPinCode";
 const char SECRET_KEY_STORE_NAME[]       = "secretKeyK";
 const char AUTH_ID_STORE_NAME[]          = "authorizationId";
+const char LOCK_UUID_STORE_NAME[]        = "lockUuid";
 const char ULTRA_PINCODE_STORE_NAME[]    = "ultraPinCode";
 const char ULTRA_STORE_NAME[]            = "isUltra";
 

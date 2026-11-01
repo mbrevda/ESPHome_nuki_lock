@@ -102,6 +102,7 @@ void NukiBle::initialize() {
   this->ble_address_pref_ = make_credential_pref<uint8_t[6]>(BLE_ADDRESS_STORE_NAME);
   this->secret_key_pref_ = make_credential_pref<uint8_t[32]>(SECRET_KEY_STORE_NAME);
   this->auth_id_pref_ = make_credential_pref<uint8_t[4]>(AUTH_ID_STORE_NAME);
+  this->lock_uuid_pref_ = make_credential_pref<uint8_t[16]>(LOCK_UUID_STORE_NAME);
   this->security_pincode_pref_ = make_credential_pref<uint16_t>(SECURITY_PINCODE_STORE_NAME);
   this->ultra_pincode_pref_ = make_credential_pref<uint32_t>(ULTRA_PINCODE_STORE_NAME);
   this->is_ultra_pref_ = make_credential_pref<bool>(ULTRA_STORE_NAME);
@@ -176,8 +177,12 @@ PairingResult NukiBle::pair_nuki(AuthorizationIdType idType) {
     this->save_credentials();
     result = PairingResult::Success;
     this->last_heartbeat_ = (esp_timer_get_time() / 1000);
+    ESP_LOGI(TAG, "Pairing with Nuki Lock SUCCEEDED! Auth ID: %02X%02X%02X%02X",
+             this->authorization_id_[0], this->authorization_id_[1],
+             this->authorization_id_[2], this->authorization_id_[3]);
   } else {
     result = PairingResult::Timeout;
+    ESP_LOGW(TAG, "Pairing with Nuki Lock TIMED OUT or FAILED");
   }
   this->extend_disconnect_timeout();
   this->pairing_in_progress_ = false;
@@ -235,7 +240,16 @@ bool NukiBle::connect_ble(bool pairing) {
 }
 
 void NukiBle::update_connection_state() {
+  this->check_relay_timeout();
   if (this->state() == esphome::esp32_ble_tracker::ClientState::CONNECTING || this->state() == esphome::esp32_ble_tracker::ClientState::DISCONNECTING) {
+    return;
+  }
+
+  // A relayed cloud request owns the link until it answers or check_relay_timeout() gives
+  // up; the 1s idle timeout would otherwise cut it during service discovery. Afterwards the
+  // link lingers briefly, since the app's exchange is several request/response rounds.
+  if (this->is_relay_busy()) {
+    this->extend_disconnect_timeout();
     return;
   }
 
@@ -765,6 +779,7 @@ void NukiBle::save_credentials() {
   if (this->ble_address_pref_.save(&currentBleAddress)
       && this->secret_key_pref_.save(&this->secret_key_k_)
       && this->auth_id_pref_.save(&this->authorization_id_)
+      && this->lock_uuid_pref_.save(&this->lock_uuid_)
       && esphome::global_preferences->sync()
     ) {
     if (this->debug_nuki_connect_) {
@@ -884,6 +899,8 @@ bool NukiBle::retrieve_credentials() {
       address = (address << 8) | buff[i];
     }
     this->set_address(address);
+    // Optional: only present when paired with a firmware that keeps the lock UUID.
+    this->lock_uuid_pref_.load(&this->lock_uuid_);
 
     // unpair_nuki() leaves the credentials empty
     if (is_char_array_empty(this->secret_key_k_, sizeof(this->secret_key_k_)) || is_char_array_empty(this->authorization_id_, sizeof(this->authorization_id_))) {
@@ -928,6 +945,8 @@ void NukiBle::delete_credentials() {
   bool isUltraLock = false;
   this->secret_key_pref_.save(&emptySecretKeyK);
   this->auth_id_pref_.save(&emptyAuthorizationId);
+  memset(this->lock_uuid_, 0, sizeof(this->lock_uuid_));
+  this->lock_uuid_pref_.save(&this->lock_uuid_);
   this->is_ultra_pref_.save(&isUltraLock);
   esphome::global_preferences->sync();
 
@@ -1033,8 +1052,10 @@ PairingState NukiBle::pair_state_machine(const PairingState nukiPairingState) {
           authorizationDataId[1] = (this->device_id_ >> (8 * 1)) & 0xff;
           authorizationDataId[2] = (this->device_id_ >> (8 * 2)) & 0xff;
           authorizationDataId[3] = (this->device_id_ >> (8 * 3)) & 0xff;
-          // The name field is fixed at 32 bytes (lock.py caps the id accordingly)
-          memcpy(authorizationDataName, this->device_name_.c_str(), std::min(this->device_name_.size(), sizeof(authorizationDataName)));
+          {
+            const std::string &auth_name = this->pairing_name_.empty() ? this->device_name_ : this->pairing_name_;
+            memcpy(authorizationDataName, auth_name.c_str(), std::min(auth_name.size(), sizeof(authorizationDataName)));
+          }
 
           //compose and send message
           unsigned char authorizationDataMessage[40];
@@ -1060,8 +1081,10 @@ PairingState NukiBle::pair_state_machine(const PairingState nukiPairingState) {
           authorizationDataId[1] = (this->device_id_ >> (8 * 1)) & 0xff;
           authorizationDataId[2] = (this->device_id_ >> (8 * 2)) & 0xff;
           authorizationDataId[3] = (this->device_id_ >> (8 * 3)) & 0xff;
-          // The name field is fixed at 32 bytes (lock.py caps the id accordingly)
-          memcpy(authorizationDataName, this->device_name_.c_str(), std::min(this->device_name_.size(), sizeof(authorizationDataName)));
+          {
+            const std::string &auth_name = this->pairing_name_.empty() ? this->device_name_ : this->pairing_name_;
+            memcpy(authorizationDataName, auth_name.c_str(), std::min(auth_name.size(), sizeof(authorizationDataName)));
+          }
           generate_nonce(authorizationDataNonce, sizeof(authorizationDataNonce), this->debug_nuki_hex_data_);
 
           //calculate authenticator of message to send
@@ -1374,6 +1397,12 @@ bool NukiBle::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gatt
       if (chr != nullptr && param->reg_for_notify.handle == chr->handle) {
         if (param->reg_for_notify.status == ESP_GATT_OK) {
           this->notify_registered_ = true;
+          if (this->relay_pending_write_ && this->usdio_char_ != nullptr) {
+            this->relay_pending_write_ = false;
+            ESP_LOGD(TAG, "Writing pending relay payload (%u bytes)", (unsigned) this->relay_data_.size());
+            this->usdio_char_->write_value(this->relay_data_.data(), this->relay_data_.size(), ESP_GATT_WRITE_TYPE_RSP);
+            this->relay_data_.clear();
+          }
         } else {
           ESP_LOGW(TAG, "Unable to subscribe characteristic (status %d)", param->reg_for_notify.status);
           this->invalidate_service_cache();
@@ -1419,6 +1448,21 @@ void NukiBle::notify_callback(uint16_t handle, uint8_t* recData, uint16_t length
     ESP_LOGD(TAG, "Notify callback for characteristic handle: %d of length: %d", handle, length);
   }
   print_buffer((uint8_t*)recData, length, false, "Received data", this->debug_nuki_hex_data_);
+
+  // Encrypted messages carry the authorization id in clear at bytes 24..27, so answers to
+  // our own commands stay with us and everything else belongs to the relayed app.
+  bool for_relay = this->relay_active_ && isUsdioHandle && length >= 28 &&
+                   memcmp(&recData[24], this->authorization_id_, sizeof(this->authorization_id_)) != 0;
+  if (for_relay) {
+    ESP_LOGD(TAG, "Relay active: forwarding %d raw bytes from lock indication", length);
+    this->relay_answered_ = true;
+    this->relay_last_rx_ = millis();
+    this->extend_disconnect_timeout();
+    if (this->relay_callback_) {
+      this->relay_callback_(true, recData, length);
+    }
+    return;
+  }
 
   if ((isGdioHandle && !this->is_lock_ultra()) || (isGdioUltra && (!this->recieve_encrypted_ || length < 24))) {
     //handle not encrypted msg
@@ -1494,19 +1538,19 @@ void NukiBle::handle_return_message(Command returnCode, unsigned char* data, uin
       break;
     }
     case Command::AuthorizationId : {
-      unsigned char lockId[16];
+      unsigned char *lockId = this->lock_uuid_;
       print_buffer((uint8_t*)data, dataLen, false, "authorization_id data", this->debug_nuki_hex_data_);
       if (this->is_lock_ultra()) {
         memcpy(this->authorization_id_, &data[0], 4);
-        memcpy(lockId, &data[4], sizeof(lockId));
+        memcpy(lockId, &data[4], sizeof(this->lock_uuid_));
         this->received_status_ = 0;
       } else {
         memcpy(this->authorization_id_, &data[32], 4);
-        memcpy(lockId, &data[36], sizeof(lockId));
+        memcpy(lockId, &data[36], sizeof(this->lock_uuid_));
         memcpy(this->challenge_nonce_k_, &data[52], sizeof(this->challenge_nonce_k_));
       }
       print_buffer(this->authorization_id_, sizeof(this->authorization_id_), false, AUTH_ID_STORE_NAME, this->debug_nuki_hex_data_);
-      print_buffer(lockId, sizeof(lockId), false, "lockId", this->debug_nuki_hex_data_);
+      print_buffer(lockId, sizeof(this->lock_uuid_), false, "lockId", this->debug_nuki_hex_data_);
       break;
     }
     case Command::AuthorizationEntry : {
@@ -1652,6 +1696,17 @@ const bool NukiBle::is_lock_ultra() const {
   return this->smart_lock_ultra_;
 };
 
+bool NukiBle::get_lock_uuid(char *out, size_t len) const {
+  if (len < 37 || is_char_array_empty(const_cast<unsigned char *>(this->lock_uuid_), sizeof(this->lock_uuid_))) {
+    return false;
+  }
+  const unsigned char *u = this->lock_uuid_;
+  snprintf(out, len, "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+           u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7],
+           u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]);
+  return true;
+}
+
 int NukiBle::get_rssi() const {
   return this->rssi_;
 }
@@ -1682,6 +1737,53 @@ void NukiBle::set_debug_hex_data(bool enable) {
 
 void NukiBle::set_debug_command(bool enable) {
   this->debug_nuki_command_ = enable;
+}
+
+bool NukiBle::is_relay_busy() const {
+  return this->relay_active_ || (int32_t) (this->relay_linger_until_ - millis()) > 0;
+}
+
+bool NukiBle::start_relay(const uint8_t *data, size_t len, RelayCallback callback) {
+  if (!this->can_start_relay()) return false;
+  this->relay_active_ = true;
+  this->relay_answered_ = false;
+  this->relay_callback_ = callback;
+  this->relay_start_time_ = millis();
+  this->extend_disconnect_timeout();
+
+  if (!this->connected() || !this->notify_registered_ || this->usdio_char_ == nullptr) {
+    this->relay_pending_write_ = true;
+    this->relay_data_.assign(data, data + len);
+    this->connect();
+    return true;
+  }
+
+  this->relay_pending_write_ = false;
+  return this->usdio_char_->write_value(const_cast<uint8_t*>(data), len, ESP_GATT_WRITE_TYPE_RSP) == ESP_OK;
+}
+
+void NukiBle::check_relay_timeout() {
+  static const uint32_t RELAY_QUIET_MS = 2000;
+  if (!this->relay_active_) return;
+  bool done = this->relay_answered_ && (millis() - this->relay_last_rx_ > RELAY_QUIET_MS);
+  bool timed_out = !this->relay_answered_ && (millis() - this->relay_start_time_ > 15000);
+  if (!done && !timed_out) return;
+  if (timed_out) {
+    ESP_LOGW(TAG, "Relay operation timed out");
+    this->note_lock_unanswered();
+  }
+  auto cb = this->relay_callback_;
+  this->relay_active_ = false;
+  this->relay_answered_ = false;
+  this->relay_pending_write_ = false;
+  this->relay_callback_ = nullptr;
+  this->relay_data_.clear();
+  static const uint32_t RELAY_LINGER_MS = 5000;
+  this->relay_linger_until_ = millis() + RELAY_LINGER_MS;
+  this->extend_disconnect_timeout();
+  if (cb) {
+    cb(done, nullptr, 0);
+  }
 }
 
 }  // namespace esphome::nuki_lock
