@@ -228,6 +228,15 @@ class NukiBle : public esphome::esp32_ble_client::BLEClientBase {
      */
     void get_authorization_entries(std::vector<AuthorizationEntry>* requestedAuthorizationEntries);
 
+    /**
+     * @brief Relay an end-to-end encrypted payload directly to the lock's USDIO characteristic
+     */
+    // Called with each lock indication (ok, data); then once with (true, nullptr, 0) when the
+    // lock has gone quiet, or (false, nullptr, 0) if it never answered.
+    using RelayCallback = std::function<void(bool ok, const uint8_t *resp, size_t resplen)>;
+    // True while a relay is running or lingering after one, so our own polls stay off the
+    // link while the app may still send follow-up requests.
+    bool is_relay_busy() const;
     // The running action has been sent to the lock, which may already be carrying it out.
     bool command_in_lock() const {
       return this->nuki_command_state_ == CommandState::CmdSent || this->nuki_command_state_ == CommandState::CmdAccepted;
@@ -244,12 +253,20 @@ class NukiBle : public esphome::esp32_ble_client::BLEClientBase {
       if (this->nuki_command_state_ != CommandState::CmdSent) return 0;
       return (uint32_t) ((esp_timer_get_time() / 1000) - this->time_now_);
     }
-    // A command went unanswered; cleared by the next message from the lock.
+    // A relay that already got its answer is only waiting for trailing indications, so a
+    // new request may take over the link.
+    bool can_start_relay() const { return !this->relay_active_ || this->relay_answered_; }
+    // A relayed request is waiting for the lock's answer (linger not included).
+    bool relay_in_progress() const { return this->relay_active_ && !this->relay_answered_; }
+    uint32_t get_command_timeout() const { return this->command_timeout_duration_; }
+    // A command or relay went unanswered; cleared by the next message from the lock.
     void note_lock_unanswered() {
       if (this->unanswered_since_ms_ == 0) this->unanswered_since_ms_ = millis() | 1;
     }
     // millis() of the first unanswered request since the lock last spoke, or 0.
     uint32_t unanswered_since() const { return this->unanswered_since_ms_; }
+    bool start_relay(const uint8_t *data, size_t len, RelayCallback callback);
+    void check_relay_timeout();
 
     /**
      * @brief Sends a new authorization entry to the lock via BLE
@@ -371,6 +388,14 @@ class NukiBle : public esphome::esp32_ble_client::BLEClientBase {
     * @return RSSI value
     */
     int get_rssi() const;
+    // ID and name the lock records for this authorization at pairing. A bridge must use
+    // its cloud bridgeId here, or the Nuki app/cloud treat it as an unknown bridge.
+    void set_pairing_identity(uint32_t id, const std::string &name) {
+      this->device_id_ = id;
+      this->pairing_name_ = name;
+    }
+    // Lock UUID from pairing as "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"; false if never captured.
+    bool get_lock_uuid(char *out, size_t len) const;
 
     /**
     * @brief Returns the timestamp in milliseconds when the last ble beacon has been received from the device
@@ -595,6 +620,7 @@ class NukiBle : public esphome::esp32_ble_client::BLEClientBase {
     esphome::ESPPreferenceObject ble_address_pref_;
     esphome::ESPPreferenceObject secret_key_pref_;
     esphome::ESPPreferenceObject auth_id_pref_;
+    esphome::ESPPreferenceObject lock_uuid_pref_;
     esphome::ESPPreferenceObject security_pincode_pref_;
     esphome::ESPPreferenceObject ultra_pincode_pref_;
     esphome::ESPPreferenceObject is_ultra_pref_;
@@ -616,6 +642,7 @@ class NukiBle : public esphome::esp32_ble_client::BLEClientBase {
 
     std::string device_name_;       //The name to be displayed for this authorization and used for storing preferences
     uint32_t device_id_;            //The ID of the Nuki App, Nuki Bridge or Nuki Fob to be authorized.
+    std::string pairing_name_;      //Overrides device_name_ as the authorization name when set
 
     //Keyturner Pairing Service
     const esphome::esp32_ble_tracker::ESPBTUUID pairing_service_uuid_;
@@ -645,6 +672,8 @@ class NukiBle : public esphome::esp32_ble_client::BLEClientBase {
     unsigned char remote_public_key_[32] = {0x00};
     unsigned char challenge_nonce_k_[32] = {0x00};
     unsigned char authorization_id_[4] = {0x00};
+    // The lock's own UUID, as sent in the AuthorizationId message during pairing.
+    unsigned char lock_uuid_[16] = {0x00};
     unsigned char my_public_key_[32] = {0x00};
     unsigned char my_private_key_[32] = {0x00};
     uint16_t pin_code_ = 0000;
@@ -676,7 +705,17 @@ class NukiBle : public esphome::esp32_ble_client::BLEClientBase {
     esphome::FixedVector<AuthorizationEntry> list_of_authorization_entries_;
     AuthorizationIdType authorization_id_type_ = AuthorizationIdType::Bridge;
 
+    bool relay_active_{false};
+    bool relay_pending_write_{false};
+    std::vector<uint8_t> relay_data_;
+    uint32_t relay_start_time_{0};
+    // Set once the lock answered; further indications are forwarded until it is quiet
+    // for RELAY_QUIET_MS (one app command can produce several: accepted, states, complete).
+    bool relay_answered_{false};
+    uint32_t relay_last_rx_{0};
+    uint32_t relay_linger_until_{0};
     uint32_t unanswered_since_ms_{0};
+    RelayCallback relay_callback_{nullptr};
 };
 
 // Template method definitions below (formerly NukiBle.hpp, merged in as part of consolidating
