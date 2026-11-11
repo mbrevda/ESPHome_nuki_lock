@@ -341,6 +341,7 @@ class NukiLockComponent :
         bool door_report_next(bool *open);
         bool door_report_due();
         bool door_report_held(bool open);
+        void publish_lock_reachable();
         void validate_pin();
         void validate_pin_step();
         void execute_lock_action_step();
@@ -452,6 +453,7 @@ class NukiLockComponent :
         uint32_t door_report_held_since_{0};
         uint32_t door_report_accepted_at_{0};
         uint32_t door_report_failing_since_{0};
+        uint32_t nuki_op_started_at_{0};
         LockState last_lock_state_{LockState::Undefined};
 
         // Action flags

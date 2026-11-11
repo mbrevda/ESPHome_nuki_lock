@@ -73,10 +73,6 @@ void NukiLockComponent::process_key_turner_state() {
     this->last_lock_state_ = current_lock_state;
 
     #ifdef USE_BINARY_SENSOR
-    if (this->connected_binary_sensor_ != nullptr) {
-        this->connected_binary_sensor_->publish_state(this->connected_);
-    }
-    
     if (this->battery_critical_binary_sensor_ != nullptr) {
         this->battery_critical_binary_sensor_->publish_state(this->nuki_lock_.is_battery_critical());
     }
@@ -212,6 +208,22 @@ void NukiLockComponent::process_key_turner_state() {
 void NukiLockComponent::update_status() {
     CmdResult cmd_result = this->nuki_lock_.request_key_turner_state(&(this->retrieved_key_turner_state_));
     if (cmd_result == CmdResult::Working) {
+#ifdef USE_BINARY_SENSOR
+        // The lock answers a status read in ~0.1s, but sometimes sits on one until the
+        // command timeout, holding a door report behind it. It's only a read, so drop it
+        // and send the report on a fresh connection; status_update_ stays set to read again.
+        static const uint32_t STATUS_READ_YIELD_MS = 1000;
+        bool door_open;
+        uint32_t waiting = this->nuki_lock_.command_waiting_ms();
+        if (waiting > STATUS_READ_YIELD_MS && this->door_report_due() && this->door_report_next(&door_open) &&
+            !this->door_report_held(door_open)) {
+            ESP_LOGW(TAG, "Status read unanswered for %" PRIu32 "ms; dropping it for the door report", waiting);
+            this->nuki_lock_.abandon_command();
+            this->nuki_lock_.note_lock_unanswered();
+            this->nuki_lock_.disconnect();
+            this->nuki_op_active_ = false;
+        }
+#endif
         return;  // still in flight on the single Nuki command slot; retry next tick
     }
     this->status_update_ = false;
@@ -237,12 +249,6 @@ void NukiLockComponent::update_status() {
 
             // Publish failed state only when having too many consecutive errors
             this->publish_state(lock::LOCK_STATE_NONE);
-
-            #ifdef USE_BINARY_SENSOR
-            if (this->connected_binary_sensor_ != nullptr) {
-                this->connected_binary_sensor_->publish_state(this->connected_);
-            }
-            #endif
         }
     }
 }
@@ -350,7 +356,6 @@ void NukiLockComponent::update_config() {
         #endif
     } else {
         ESP_LOGE(TAG, "request_config has resulted in %s (%d)", str, conf_req_result);
-        this->config_update_ = true;
     }
 }
 
@@ -471,7 +476,6 @@ void NukiLockComponent::update_advanced_config() {
         #endif
     } else {
         ESP_LOGE(TAG, "request_advanced_config has resulted in %s (%d)", str, conf_req_result);
-        this->advanced_config_update_ = true;
     }
 }
 
@@ -500,7 +504,6 @@ void NukiLockComponent::update_auth_data() {
         this->auth_data_ready_time_ = millis() + 5000;
     } else {
         ESP_LOGE(TAG, "retrieve_authorization_entries has resulted in %s (%d)", auth_data_req_result_as_string, auth_data_req_result);
-        this->auth_data_update_ = true;
     }
 }
 
@@ -576,7 +579,6 @@ void NukiLockComponent::update_battery_report() {
         #endif
     } else {
         ESP_LOGE(TAG, "request_battery_report has resulted in %s (%d)", str, result);
-        this->battery_report_update_ = true;
     }
 }
 
@@ -678,6 +680,26 @@ bool NukiLockComponent::door_report_held(bool open) {
     return millis() - this->door_report_held_since_ < MAX_HOLD_MS;
 }
 
+void NukiLockComponent::publish_lock_reachable() {
+#ifdef USE_BINARY_SENSOR
+    // Unreachable once the lock has left requests unanswered, or an operation has been
+    // stuck (e.g. never connecting), for this long.
+    static const uint32_t UNREACHABLE_AFTER_MS = 30000;
+    uint32_t now = millis();
+    uint32_t since = this->nuki_lock_.unanswered_since();
+    bool unanswered = since != 0 && now - since > UNREACHABLE_AFTER_MS;
+    bool stuck = this->nuki_op_started_at_ != 0 && now - this->nuki_op_started_at_ > UNREACHABLE_AFTER_MS;
+    bool reachable = !unanswered && !stuck;
+    if (this->connected_binary_sensor_ != nullptr &&
+        (!this->connected_binary_sensor_->has_state() || this->connected_binary_sensor_->state != reachable)) {
+        if (!reachable) {
+            ESP_LOGW(TAG, "Lock unreachable for %" PRIu32 "s", UNREACHABLE_AFTER_MS / 1000);
+        }
+        this->connected_binary_sensor_->publish_state(reachable);
+    }
+#endif
+}
+
 void NukiLockComponent::update_event_logs() {
     if(this->pin_state_ != PinState::Valid) {
         ESP_LOGW(TAG, "It seems like you did not set a valid pin!");
@@ -709,7 +731,6 @@ void NukiLockComponent::update_event_logs() {
         #endif
     } else {
         ESP_LOGE(TAG, "retrieve_log_entries has resulted in %s (%d)", event_log_req_result_as_string, event_log_req_result);
-        this->event_log_update_ = true;
     }
 }
 
@@ -929,7 +950,19 @@ void NukiLockComponent::execute_lock_action_step() {
 
     App.feed_wdt();
 
+    bool completed = true;
     if (result == CmdResult::Working) {
+#ifdef USE_BINARY_SENSOR
+        // An unlatch can stay incomplete until the lock hears the door open, and that
+        // report would otherwise wait behind it. Once the action has reached the lock,
+        // stop waiting so the report can go out.
+        if (this->door_report_due() && this->nuki_lock_.command_in_lock()) {
+            ESP_LOGI(TAG, "Lock action sent; sending the door report instead of waiting for completion");
+            this->nuki_lock_.abandon_command();
+            result = CmdResult::Success;
+            completed = false;
+        } else
+#endif
         return;  // still in flight on the single Nuki command slot; retry next tick
     }
 
@@ -949,6 +982,14 @@ void NukiLockComponent::execute_lock_action_step() {
         if (this->lock_action_ == this->executing_lock_action_) {
             // Stop action attempts only if no new action was received in the meantime.
             // Otherwise, the new action won't be executed.
+            this->action_attempts_ = 0;
+        }
+    } else if (this->nuki_lock_.command_reached_lock()) {
+        // The lock got the action (it answers busy while still carrying out an earlier
+        // one), so a retry could unlock or unlatch a second time. The status update below
+        // shows what actually happened.
+        ESP_LOGW(TAG, "lock_action %s (%d) has resulted in %s (%d); not retrying, the lock received it", lock_action_as_string, (int)this->executing_lock_action_, result_as_string, result);
+        if (this->lock_action_ == this->executing_lock_action_) {
             this->action_attempts_ = 0;
         }
     } else {
@@ -973,7 +1014,8 @@ void NukiLockComponent::execute_lock_action_step() {
     // that instead of requesting it: some locks don't answer a status request on the same
     // connection right after the action (#117). The advertisement then flags this very state
     // change too, which would trigger the same request - ignore that for a moment.
-    if (is_execution_successful && this->nuki_lock_.take_pushed_key_turner_state(&this->retrieved_key_turner_state_)) {
+    // An action we stopped waiting on hasn't pushed its final state yet, so read it instead.
+    if (is_execution_successful && completed && this->nuki_lock_.take_pushed_key_turner_state(&this->retrieved_key_turner_state_)) {
         ESP_LOGD(TAG, "Using the state pushed by the lock during the action");
         this->process_key_turner_state();
         this->ignore_status_beacon_until_ = millis() + IGNORE_STATUS_BEACON_AFTER_ACTION_MILLIS;
@@ -1164,6 +1206,8 @@ void NukiLockComponent::loop()
     }
     this->last_loop_time_ = current_time;
 
+    this->publish_lock_reachable();
+
     // Advertisements are now scanned by esp32_ble_tracker (configured by the user's own
     // esp32_ble_tracker: block) and delivered via NukiBle::parse_device(), so there is no
     // scanner to kick here anymore.
@@ -1201,6 +1245,9 @@ void NukiLockComponent::loop()
         bool idle = false;
         if (!this->nuki_op_active_) {
             this->door_report_in_flight_ = false;  // in case the report was cut short elsewhere
+            this->nuki_op_started_at_ = 0;
+        } else if (this->nuki_op_started_at_ == 0) {
+            this->nuki_op_started_at_ = millis() | 1;
         }
         if (this->nuki_op_active_) {
             this->nuki_op_step_();

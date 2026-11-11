@@ -165,7 +165,7 @@ lock:
     pairing_mode:
       name: "Pairing Mode"
   # Binary Sensors
-    connected:
+    connected:                 # off after 30s of unanswered requests or a stuck connection
       name: "Connected"
     paired:
       name: "Paired"
