@@ -165,7 +165,7 @@ lock:
     pairing_mode:
       name: "Pairing Mode"
   # Binary Sensors
-    connected:
+    connected:                 # off after 30s of unanswered requests or a stuck connection
       name: "Connected"
     paired:
       name: "Paired"
@@ -316,6 +316,10 @@ lock:
       - lambda: ESP_LOGI("nuki_lock", "Pairing mode turned off");
     on_paired_action:
       - lambda: ESP_LOGI("nuki_lock", "Paired sucessfuly");
+    on_connected_action:
+      - lambda: ESP_LOGI("nuki_lock", "Lock connected");
+    on_disconnected_action:
+      - lambda: ESP_LOGI("nuki_lock", "Lock disconnected");
     on_event_log_action:
       - lambda: |-
           ESP_LOGI("nuki_lock", "Event Log (NukiLock::LogEntry) received index: %i, authId: %i", x.index, x.authId);
@@ -645,10 +649,16 @@ lock:
       - lambda: ESP_LOGI("nuki_lock", "Pairing mode turned off");
     on_paired_action:
       - lambda: ESP_LOGI("nuki_lock", "Paired sucessfuly");
+    on_connected_action:      # the lock is reachable again
+      - logger.log: "Lock connected"
+    on_disconnected_action:   # the lock went unreachable
+      - logger.log: "Lock disconnected"
     on_event_log_action:   # needs event logs, see above
       - lambda: |-
           ESP_LOGI("nuki_lock", "Event Log (NukiLock::LogEntry) received index: %i, authId: %i", x.index, x.authId);
 ```
+
+`on_connected_action` and `on_disconnected_action` follow the `connected` binary sensor, and work without it: disconnected after 30s of unanswered requests or a stuck connection, connected once the lock answers again. They only fire while paired, and not for the starting state after boot or pairing, so a lock that is never found fires `on_disconnected_action` about 30s after boot.
 
 ---
 

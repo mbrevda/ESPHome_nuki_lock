@@ -1407,6 +1407,7 @@ bool NukiBle::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gatt
 // handles) in place of the NimBLE-era UUID comparison.
 void NukiBle::notify_callback(uint16_t handle, uint8_t* recData, uint16_t length) {
   this->last_heartbeat_ = (esp_timer_get_time() / 1000);
+  this->unanswered_since_ms_ = 0;
 
   bool isGdioHandle = this->gdio_char_ != nullptr && handle == this->gdio_char_->handle;
   bool isUsdioHandle = this->usdio_char_ != nullptr && handle == this->usdio_char_->handle;

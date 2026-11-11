@@ -228,6 +228,29 @@ class NukiBle : public esphome::esp32_ble_client::BLEClientBase {
      */
     void get_authorization_entries(std::vector<AuthorizationEntry>* requestedAuthorizationEntries);
 
+    // The running action has been sent to the lock, which may already be carrying it out.
+    bool command_in_lock() const {
+      return this->nuki_command_state_ == CommandState::CmdSent || this->nuki_command_state_ == CommandState::CmdAccepted;
+    }
+    // The last action got as far as the lock, so sending it again could repeat it.
+    bool command_reached_lock() const { return this->command_reached_lock_; }
+    // Stop waiting for the running command to complete; the link is left as it is.
+    void abandon_command() {
+      this->nuki_command_state_ = CommandState::Idle;
+      this->last_msg_code_received_ = Command::Empty;
+    }
+    // How long the running request has waited for the lock's answer, or 0 if none is waiting.
+    uint32_t command_waiting_ms() const {
+      if (this->nuki_command_state_ != CommandState::CmdSent) return 0;
+      return (uint32_t) ((esp_timer_get_time() / 1000) - this->time_now_);
+    }
+    // A command went unanswered; cleared by the next message from the lock.
+    void note_lock_unanswered() {
+      if (this->unanswered_since_ms_ == 0) this->unanswered_since_ms_ = millis() | 1;
+    }
+    // millis() of the first unanswered request since the lock last spoke, or 0.
+    uint32_t unanswered_since() const { return this->unanswered_since_ms_; }
+
     /**
      * @brief Sends a new authorization entry to the lock via BLE
      *
@@ -610,6 +633,7 @@ class NukiBle : public esphome::esp32_ble_client::BLEClientBase {
     const std::string preferences_id_;
 
     CommandState nuki_command_state_ = CommandState::Idle;
+    bool command_reached_lock_{false};
 
     bool is_paired_ = false;
 
@@ -651,6 +675,8 @@ class NukiBle : public esphome::esp32_ble_client::BLEClientBase {
     std::vector<FingerprintEntry> list_of_fingerprint_entries_;
     esphome::FixedVector<AuthorizationEntry> list_of_authorization_entries_;
     AuthorizationIdType authorization_id_type_ = AuthorizationIdType::Bridge;
+
+    uint32_t unanswered_since_ms_{0};
 };
 
 // Template method definitions below (formerly NukiBle.hpp, merged in as part of consolidating
@@ -755,6 +781,7 @@ CmdResult NukiBle::cmd_state_machine(const TDeviceAction action) {
         ESP_LOGW(HPP_TAG, "Command failed: timeout");
         this->disconnect();
         this->nuki_command_state_ = CommandState::Idle;
+        this->note_lock_unanswered();
         return CmdResult::TimeOut;
       } else if (this->last_msg_code_received_ != Command::ErrorReport && this->last_msg_code_received_ != Command::Empty) {
         if (this->debug_nuki_communication_) {
@@ -831,6 +858,7 @@ CmdResult NukiBle::cmd_chall_state_machine(const TDeviceAction action, const boo
         ESP_LOGW(HPP_TAG, "Command failed: timeout");
         this->disconnect();
         this->nuki_command_state_ = CommandState::Idle;
+        this->note_lock_unanswered();
         return CmdResult::TimeOut;
       } else if (this->last_msg_code_received_ == Command::Challenge) {
         this->nuki_command_state_ = CommandState::ChallengeRespReceived;
@@ -892,6 +920,7 @@ CmdResult NukiBle::cmd_chall_state_machine(const TDeviceAction action, const boo
         ESP_LOGW(HPP_TAG, "Command failed: timeout");
         this->disconnect();
         this->nuki_command_state_ = CommandState::Idle;
+        this->note_lock_unanswered();
         return CmdResult::TimeOut;
       } else if (this->last_msg_code_received_ == Command::ErrorReport && this->error_code_ != 69) {
         if (this->debug_nuki_communication_) {
@@ -936,6 +965,7 @@ CmdResult NukiBle::cmd_chall_acc_state_machine(const TDeviceAction action) {
         ESP_LOGD(HPP_TAG, "Sending challenge");
       }
       this->last_msg_code_received_ = Command::Empty;
+      this->command_reached_lock_ = false;
       unsigned char payload[sizeof(Command)] = {0x04, 0x00};  //challenge
 
       if (this->send_encrypted_message(Command::RequestData, payload, sizeof(Command))) {
@@ -966,6 +996,7 @@ CmdResult NukiBle::cmd_chall_acc_state_machine(const TDeviceAction action) {
         ESP_LOGW(HPP_TAG, "Command failed: timeout");
         this->disconnect();
         this->nuki_command_state_ = CommandState::Idle;
+        this->note_lock_unanswered();
         return CmdResult::TimeOut;
       } else if (this->last_msg_code_received_ == Command::Challenge) {
         this->nuki_command_state_ = CommandState::ChallengeRespReceived;
@@ -987,6 +1018,7 @@ CmdResult NukiBle::cmd_chall_acc_state_machine(const TDeviceAction action) {
       if (this->send_encrypted_message(action.command, payload, action.payloadLen + sizeof(this->challenge_nonce_k_))) {
         this->time_now_ = (esp_timer_get_time() / 1000);
         this->nuki_command_state_ = CommandState::CmdSent;
+        this->command_reached_lock_ = true;
       } else if (!(this->connected() && this->notify_registered_)) {
         // Connection not fully ready yet (covers the whole CONNECTING/CONNECTED/ESTABLISHED
         // window until notify-subscription confirms, not just CONNECTING) - retry next call
@@ -1012,7 +1044,15 @@ CmdResult NukiBle::cmd_chall_acc_state_machine(const TDeviceAction action) {
         ESP_LOGW(HPP_TAG, "Accept failed: timeout");
         this->disconnect();
         this->nuki_command_state_ = CommandState::Idle;
+        this->note_lock_unanswered();
         return CmdResult::TimeOut;
+      } else if (this->last_msg_code_received_ == Command::ErrorReport) {
+        // The lock refused the action outright (e.g. 0x45 busy); waiting for an accept
+        // would only run into the timeout.
+        this->disconnect();
+        this->nuki_command_state_ = CommandState::Idle;
+        this->last_msg_code_received_ = Command::Empty;
+        return this->error_code_ == 69 ? CmdResult::Lock_Busy : CmdResult::Failed;
       } else if (this->last_msg_code_received_ == Command::Status && (CommandStatus)this->received_status_ == CommandStatus::Accepted) {
         this->time_now_ = (esp_timer_get_time() / 1000);
         this->nuki_command_state_ = CommandState::CmdAccepted;
@@ -1036,6 +1076,7 @@ CmdResult NukiBle::cmd_chall_acc_state_machine(const TDeviceAction action) {
         ESP_LOGW(HPP_TAG, "Command failed: timeout");
         this->disconnect();
         this->nuki_command_state_ = CommandState::Idle;
+        this->note_lock_unanswered();
         return CmdResult::TimeOut;
       } else if (this->last_msg_code_received_ == Command::ErrorReport && this->error_code_ != 69) {
         if (this->debug_nuki_communication_) {

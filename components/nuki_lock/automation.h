@@ -77,6 +77,20 @@ class PairedTrigger : public Trigger<> {
         }
 };
 
+class ConnectedTrigger : public Trigger<> {
+    public:
+        ConnectedTrigger(NukiLockComponent *parent) {
+            parent->add_connected_callback([this]() { this->trigger(); });
+        }
+};
+
+class DisconnectedTrigger : public Trigger<> {
+    public:
+        DisconnectedTrigger(NukiLockComponent *parent) {
+            parent->add_disconnected_callback([this]() { this->trigger(); });
+        }
+};
+
 class EventLogReceivedTrigger : public Trigger<LogEntry> {
     public:
         EventLogReceivedTrigger(NukiLockComponent *parent) {

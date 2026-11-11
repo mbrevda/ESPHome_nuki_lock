@@ -39,9 +39,12 @@ class NukiBle {
   bool send_encrypted_message(Command, unsigned char *, uint8_t) { return true; }
   bool connected() const { return true; }
   void disconnect() { disconnected = true; }
+  void note_lock_unanswered() { unanswered = true; }
   bool debug_nuki_communication_ = false;
   bool notify_registered_ = true;
   bool disconnected = false;
+  bool unanswered = false;
+  bool command_reached_lock_ = false;
   CommandState nuki_command_state_ = CommandState::CmdSent;
   Command last_msg_code_received_ = Command::Status;
   uint8_t received_status_ = static_cast<uint8_t>(CommandStatus::Accepted);
@@ -64,6 +67,23 @@ int main(int argc, char **argv) {
     ble.received_status_ = static_cast<uint8_t>(CommandStatus::Complete);
     assert(ble.cmd_chall_acc_state_machine(action) == CmdResult::Success);
     assert(ble.nuki_command_state_ == CommandState::Idle);
+    return 0;
+  }
+  if (scenario == "error_before_accept" || scenario == "busy_before_accept") {
+    ble.last_msg_code_received_ = Command::ErrorReport;
+    ble.error_code_ = scenario == "busy_before_accept" ? 69 : 1;
+    const auto expected = scenario == "busy_before_accept" ? CmdResult::Lock_Busy : CmdResult::Failed;
+    assert(ble.cmd_chall_acc_state_machine(action) == expected);
+    assert(ble.disconnected);
+    assert(ble.nuki_command_state_ == CommandState::Idle);
+    return 0;
+  }
+  if (scenario == "accept_timeout") {
+    ble.last_msg_code_received_ = Command::Empty;
+    now_ms += 10001;
+    assert(ble.cmd_chall_acc_state_machine(action) == CmdResult::TimeOut);
+    assert(ble.disconnected);
+    assert(ble.unanswered);
     return 0;
   }
   assert(ble.cmd_chall_acc_state_machine(action) == CmdResult::Working);
@@ -95,6 +115,7 @@ int main(int argc, char **argv) {
     now_ms += 10001;
     assert(ble.cmd_chall_acc_state_machine(action) == CmdResult::TimeOut);
     assert(ble.disconnected);
+    assert(ble.unanswered);
     assert(ble.nuki_command_state_ == CommandState::Idle);
   } else if (scenario == "error" || scenario == "busy") {
     ble.last_msg_code_received_ = Command::ErrorReport;
@@ -142,6 +163,7 @@ class CommandCompletionTests(unittest.TestCase):
         for scenario in (
             "wait_for_completion", "immediate_completion", "complete_without_accept",
             "unrelated_message", "duplicate_accept", "timeout", "error", "busy",
+            "error_before_accept", "busy_before_accept", "accept_timeout",
         ):
             with self.subTest(scenario=scenario):
                 result = subprocess.run(
