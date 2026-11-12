@@ -39,6 +39,9 @@ void NukiLockComponent::process_key_turner_state() {
 
     this->status_update_consecutive_errors_ = 0;
     this->connected_ = true;
+    if (this->bridge_ != nullptr) {
+        this->bridge_->on_lock_reachable();
+    }
 
     LockState current_lock_state = this->retrieved_key_turner_state_.lockState;
     char current_lock_state_as_string[30] = {0};
@@ -59,10 +62,30 @@ void NukiLockComponent::process_key_turner_state() {
     this->publish_state(nuki_lock::nuki_to_lock_state(this->retrieved_key_turner_state_.lockState));
 
     #ifdef USE_BINARY_SENSOR
-    if (this->connected_binary_sensor_ != nullptr) {
-        this->connected_binary_sensor_->publish_state(this->connected_);
+    bool unlatch_state = current_lock_state == LockState::Unlatching || current_lock_state == LockState::Unlatched;
+    bool was_unlatch_state = this->last_lock_state_ == LockState::Unlatching || this->last_lock_state_ == LockState::Unlatched;
+    // Leaving the unlatch states means the latch is back: an OPEN still owed has nothing to
+    // release, so just report the sensor's current state.
+    if (was_unlatch_state && !unlatch_state && this->door_report_open_owed_) {
+        ESP_LOGI(TAG, "Re-latched before the door report landed: dropping the owed OPEN");
+        this->door_report_open_owed_ = false;
+        this->door_report_retry_at_ = 0;
     }
-    
+    #endif
+
+    #ifdef USE_SENSOR
+    // The battery report carries the last action's travel; fetch it once the motor stops.
+    bool was_moving = this->last_lock_state_ == LockState::Locking || this->last_lock_state_ == LockState::Unlocking ||
+                      this->last_lock_state_ == LockState::Unlatching || this->last_lock_state_ == LockState::Unlatched;
+    bool moving = current_lock_state == LockState::Locking || current_lock_state == LockState::Unlocking ||
+                  current_lock_state == LockState::Unlatching || current_lock_state == LockState::Unlatched;
+    if (this->lock_distance_sensor_ != nullptr && was_moving && !moving) {
+        this->battery_report_update_ = true;
+    }
+    #endif
+    this->last_lock_state_ = current_lock_state;
+
+    #ifdef USE_BINARY_SENSOR
     if (this->battery_critical_binary_sensor_ != nullptr) {
         this->battery_critical_binary_sensor_->publish_state(this->nuki_lock_.is_battery_critical());
     }
@@ -96,6 +119,21 @@ void NukiLockComponent::process_key_turner_state() {
         validate_pin();
     }
     
+    // A report that failed for good leaves the lock with the wrong door state; any
+    // later status read shows it, so send the sensor's state again.
+    DoorSensorState lock_door_state = this->retrieved_key_turner_state_.doorSensorState;
+    bool next_open;
+    if (this->door_sensor_input_ != nullptr && !this->door_report_next(&next_open) &&
+        !this->door_report_in_flight_ && millis() - this->door_report_accepted_at_ > 2000 &&
+        (lock_door_state == DoorSensorState::DoorOpened || lock_door_state == DoorSensorState::DoorClosed)) {
+        bool sensor_open = this->door_sensor_report_open_;
+        if (sensor_open != (lock_door_state == DoorSensorState::DoorOpened)) {
+            ESP_LOGI(TAG, "Lock thinks the door is %s; reporting %s again", sensor_open ? "closed" : "open",
+                     sensor_open ? "OPEN" : "CLOSED");
+            this->door_report_lock_open_ = !sensor_open;
+        }
+    }
+
     if (this->door_sensor_binary_sensor_ != nullptr) {
         DoorSensorState door_sensor_state = this->retrieved_key_turner_state_.doorSensorState;
         if(door_sensor_state != DoorSensorState::Unavailable) {
@@ -124,6 +162,10 @@ void NukiLockComponent::process_key_turner_state() {
     }
     #endif
     #ifdef USE_TEXT_SENSOR
+    if (this->lock_state_text_sensor_ != nullptr) {
+        this->lock_state_text_sensor_->publish_state(current_lock_state_as_string);
+    }
+
     if (this->door_sensor_state_text_sensor_ != nullptr){
         memset(str, 0, sizeof(str));
         door_sensor_state_to_string(this->retrieved_key_turner_state_.doorSensorState, str);
@@ -183,6 +225,22 @@ void NukiLockComponent::process_key_turner_state() {
 void NukiLockComponent::update_status() {
     CmdResult cmd_result = this->nuki_lock_.request_key_turner_state(&(this->retrieved_key_turner_state_));
     if (cmd_result == CmdResult::Working) {
+#ifdef USE_BINARY_SENSOR
+        // The lock answers a status read in ~0.1s, but sometimes sits on one until the
+        // command timeout, holding a door report behind it. It's only a read, so drop it
+        // and send the report on a fresh connection; status_update_ stays set to read again.
+        static const uint32_t STATUS_READ_YIELD_MS = 1000;
+        bool door_open;
+        uint32_t waiting = this->nuki_lock_.command_waiting_ms();
+        if (waiting > STATUS_READ_YIELD_MS && this->door_report_due() && this->door_report_next(&door_open) &&
+            !this->door_report_held(door_open)) {
+            ESP_LOGW(TAG, "Status read unanswered for %" PRIu32 "ms; dropping it for the door report", waiting);
+            this->nuki_lock_.abandon_command();
+            this->nuki_lock_.note_lock_unanswered();
+            this->nuki_lock_.disconnect();
+            this->nuki_op_active_ = false;
+        }
+#endif
         return;  // still in flight on the single Nuki command slot; retry next tick
     }
     this->status_update_ = false;
@@ -208,12 +266,6 @@ void NukiLockComponent::update_status() {
 
             // Publish failed state only when having too many consecutive errors
             this->publish_state(lock::LOCK_STATE_NONE);
-
-            #ifdef USE_BINARY_SENSOR
-            if (this->connected_binary_sensor_ != nullptr) {
-                this->connected_binary_sensor_->publish_state(this->connected_);
-            }
-            #endif
         }
     }
 }
@@ -319,9 +371,12 @@ void NukiLockComponent::update_config() {
             this->advertising_mode_select_->publish_state(str);
         }
         #endif
+
+        if (this->bridge_ != nullptr && this->nuki_lock_config_.nukiId != 0) {
+            this->bridge_->send_push_nukis_request();
+        }
     } else {
         ESP_LOGE(TAG, "request_config has resulted in %s (%d)", str, conf_req_result);
-        this->config_update_ = true;
     }
 }
 
@@ -442,7 +497,6 @@ void NukiLockComponent::update_advanced_config() {
         #endif
     } else {
         ESP_LOGE(TAG, "request_advanced_config has resulted in %s (%d)", str, conf_req_result);
-        this->advanced_config_update_ = true;
     }
 }
 
@@ -471,7 +525,6 @@ void NukiLockComponent::update_auth_data() {
         this->auth_data_ready_time_ = millis() + 5000;
     } else {
         ESP_LOGE(TAG, "retrieve_authorization_entries has resulted in %s (%d)", auth_data_req_result_as_string, auth_data_req_result);
-        this->auth_data_update_ = true;
     }
 }
 
@@ -544,28 +597,134 @@ void NukiLockComponent::update_battery_report() {
         if (this->motor_current_sensor_ != nullptr) {
             this->motor_current_sensor_->publish_state(this->battery_report_.maxTurnCurrent);
         }
+
+        if (this->lock_distance_sensor_ != nullptr) {
+            this->lock_distance_sensor_->publish_state(this->battery_report_.lockDistance);
+        }
         #endif
     } else {
         ESP_LOGE(TAG, "request_battery_report has resulted in %s (%d)", str, result);
-        this->battery_report_update_ = true;
     }
 }
 
+bool NukiLockComponent::door_report_next(bool *open) {
+#ifdef USE_BINARY_SENSOR
+    if (this->door_sensor_input_ == nullptr || !this->door_sensor_input_->has_state()) {
+        return false;
+    }
+    if (this->door_report_open_owed_) {
+        // The lock re-latches on OPEN: a door that opened is reported OPEN, even if it has closed since
+        *open = true;
+        return true;
+    }
+    *open = this->door_sensor_report_open_;
+    return !this->door_report_lock_open_.has_value() || *this->door_report_lock_open_ != *open;
+#else
+    return false;
+#endif
+}
+
+bool NukiLockComponent::door_report_due() {
+    bool open;
+    return this->door_report_next(&open) &&
+           (this->door_report_retry_at_ == 0 || (int32_t) (millis() - this->door_report_retry_at_) >= 0);
+}
+
 void NukiLockComponent::report_door_sensor_step() {
-    CmdResult result = this->nuki_lock_.report_door_sensor_state(this->door_sensor_report_sending_open_);
+    // A busy lock can take seconds to answer. Cutting it off mid-command seems to upset
+    // it, so the report gets the normal command timeout.
+    bool open = this->door_sensor_report_sending_open_;
+    this->door_report_in_flight_ = true;
+    CmdResult result = this->nuki_lock_.report_door_sensor_state(open);
     if (result == CmdResult::Working) {
         return;  // still in flight on the single Nuki command slot; retry next tick
     }
+    this->door_report_in_flight_ = false;
     this->nuki_op_active_ = false;
 
     App.feed_wdt();
 
-    const char *state = this->door_sensor_report_sending_open_ ? "OPEN" : "CLOSED";
+    const char *state = open ? "OPEN" : "CLOSED";
+    // The lock answers some reports and ignores others in the same state, so a failed
+    // report is sent again (door_report_next() keeps sending an OPEN that never arrived, since
+    // that is what releases the latch). Retry sooner when the lock says its
+    // state changed, or at once on a new door event. Stop after the lock's unlatch hold;
+    // the next status read catches the lock up from there.
+    static const uint32_t RETRY_DELAY_FIRST_MS = 1000;
+    static const uint32_t RETRY_DELAY_MS = 3000;
+    // The lock's own Unlatch Duration (1-30s); 255 until the advanced config has been read.
+    uint8_t unlatch_duration = this->nuki_lock_advanced_config_.unlatchDuration;
+    const uint32_t RETRY_WINDOW_MS = (unlatch_duration >= 1 && unlatch_duration <= 30 ? unlatch_duration : 30) * 1000;
     if (result == CmdResult::Success) {
         ESP_LOGI(TAG, "Door sensor report: %s -> accepted", state);
-    } else {
-        ESP_LOGW(TAG, "Door sensor report: %s -> failed (%d)", state, result);
+        this->door_report_lock_open_ = open;
+        if (open) {
+            this->door_report_open_owed_ = false;
+        }
+        this->door_report_retries_used_ = 0;
+        this->door_report_retry_at_ = 0;
+        this->door_report_failing_since_ = 0;
+        this->door_report_accepted_at_ = millis();
+        return;
     }
+    if (this->door_report_failing_since_ == 0) {
+        this->door_report_failing_since_ = millis() | 1;
+    }
+    if (millis() - this->door_report_failing_since_ < RETRY_WINDOW_MS) {
+        uint32_t delay = this->door_report_retries_used_ == 0 ? RETRY_DELAY_FIRST_MS : RETRY_DELAY_MS;
+        this->door_report_retries_used_++;
+        ESP_LOGW(TAG, "Door sensor report: %s -> failed (%d), retry %u in %" PRIu32 "ms or on the next lock event",
+                 state, result, this->door_report_retries_used_, delay);
+        this->door_report_retry_at_ = (millis() + delay) | 1;
+    } else {
+        ESP_LOGW(TAG, "Door sensor report: %s -> failed (%d), giving up after %" PRIu32 "ms", state, result,
+                 millis() - this->door_report_failing_since_);
+        // Assume the lock has the sensor's state; the next status read shows if it doesn't
+        this->door_report_lock_open_ = this->door_sensor_report_open_;
+        this->door_report_open_owed_ = false;
+        this->door_report_retries_used_ = 0;
+        this->door_report_retry_at_ = 0;
+        this->door_report_failing_since_ = 0;
+    }
+}
+
+bool NukiLockComponent::door_report_held(bool open) {
+    // CLOSED reports sent while the motor ran went unanswered, so wait for it to stop. OPEN
+    // releases the latch and never waits. The lock state can be stale, hence the cap.
+    // After an app command the motor runs while our polls are held back, so the lock state
+    // never shows it; treat a busy relay as moving too.
+    static const uint32_t MAX_HOLD_MS = 5000;
+    bool moving = this->last_lock_state_ == LockState::Locking || this->last_lock_state_ == LockState::Unlocking ||
+                  this->last_lock_state_ == LockState::Unlatching || this->nuki_lock_.is_relay_busy();
+    if (open || !moving) {
+        this->door_report_held_since_ = 0;
+        return false;
+    }
+    if (this->door_report_held_since_ == 0) {
+        ESP_LOGD(TAG, "Holding the CLOSED report while the lock is busy");
+        this->door_report_held_since_ = millis() | 1;
+    }
+    return millis() - this->door_report_held_since_ < MAX_HOLD_MS;
+}
+
+void NukiLockComponent::publish_lock_reachable() {
+#ifdef USE_BINARY_SENSOR
+    // Unreachable once the lock has left requests unanswered, or an operation has been
+    // stuck (e.g. never connecting), for this long.
+    static const uint32_t UNREACHABLE_AFTER_MS = 30000;
+    uint32_t now = millis();
+    uint32_t since = this->nuki_lock_.unanswered_since();
+    bool unanswered = since != 0 && now - since > UNREACHABLE_AFTER_MS;
+    bool stuck = this->nuki_op_started_at_ != 0 && now - this->nuki_op_started_at_ > UNREACHABLE_AFTER_MS;
+    bool reachable = !unanswered && !stuck;
+    if (this->connected_binary_sensor_ != nullptr &&
+        (!this->connected_binary_sensor_->has_state() || this->connected_binary_sensor_->state != reachable)) {
+        if (!reachable) {
+            ESP_LOGW(TAG, "Lock unreachable for %" PRIu32 "s", UNREACHABLE_AFTER_MS / 1000);
+        }
+        this->connected_binary_sensor_->publish_state(reachable);
+    }
+#endif
 }
 
 void NukiLockComponent::update_event_logs() {
@@ -599,7 +758,6 @@ void NukiLockComponent::update_event_logs() {
         #endif
     } else {
         ESP_LOGE(TAG, "retrieve_log_entries has resulted in %s (%d)", event_log_req_result_as_string, event_log_req_result);
-        this->event_log_update_ = true;
     }
 }
 
@@ -819,7 +977,19 @@ void NukiLockComponent::execute_lock_action_step() {
 
     App.feed_wdt();
 
+    bool completed = true;
     if (result == CmdResult::Working) {
+#ifdef USE_BINARY_SENSOR
+        // An unlatch can stay incomplete until the lock hears the door open, and that
+        // report would otherwise wait behind it. Once the action has reached the lock,
+        // stop waiting so the report can go out.
+        if (this->door_report_due() && this->nuki_lock_.command_in_lock()) {
+            ESP_LOGI(TAG, "Lock action sent; sending the door report instead of waiting for completion");
+            this->nuki_lock_.abandon_command();
+            result = CmdResult::Success;
+            completed = false;
+        } else
+#endif
         return;  // still in flight on the single Nuki command slot; retry next tick
     }
 
@@ -839,6 +1009,14 @@ void NukiLockComponent::execute_lock_action_step() {
         if (this->lock_action_ == this->executing_lock_action_) {
             // Stop action attempts only if no new action was received in the meantime.
             // Otherwise, the new action won't be executed.
+            this->action_attempts_ = 0;
+        }
+    } else if (this->nuki_lock_.command_reached_lock()) {
+        // The lock got the action (it answers busy while still carrying out an earlier
+        // one), so a retry could unlock or unlatch a second time. The status update below
+        // shows what actually happened.
+        ESP_LOGW(TAG, "lock_action %s (%d) has resulted in %s (%d); not retrying, the lock received it", lock_action_as_string, (int)this->executing_lock_action_, result_as_string, result);
+        if (this->lock_action_ == this->executing_lock_action_) {
             this->action_attempts_ = 0;
         }
     } else {
@@ -863,7 +1041,8 @@ void NukiLockComponent::execute_lock_action_step() {
     // that instead of requesting it: some locks don't answer a status request on the same
     // connection right after the action (#117). The advertisement then flags this very state
     // change too, which would trigger the same request - ignore that for a moment.
-    if (is_execution_successful && this->nuki_lock_.take_pushed_key_turner_state(&this->retrieved_key_turner_state_)) {
+    // An action we stopped waiting on hasn't pushed its final state yet, so read it instead.
+    if (is_execution_successful && completed && this->nuki_lock_.take_pushed_key_turner_state(&this->retrieved_key_turner_state_)) {
         ESP_LOGD(TAG, "Using the state pushed by the lock during the action");
         this->process_key_turner_state();
         this->ignore_status_beacon_until_ = millis() + IGNORE_STATUS_BEACON_AFTER_ACTION_MILLIS;
@@ -881,8 +1060,20 @@ void NukiLockComponent::execute_lock_action_step() {
     this->command_cooldown_millis = is_execution_successful ? COOLDOWN_COMMANDS_MILLIS : this->command_retry_delay_millis_;
 }
 
+// The PIN is never published: the entity shows a mask when one is set, empty otherwise.
+static const char *const SECURITY_PIN_MASK = "******";
+
+void NukiLockComponent::publish_security_pin() {
+    #ifdef USE_TEXT
+    if (this->security_pin_text_ != nullptr) {
+        bool set = this->security_pin_ != 0 || this->security_pin_config_.value_or(0) != 0;
+        this->security_pin_text_->publish_state(set ? SECURITY_PIN_MASK : "");
+    }
+    #endif
+}
+
 void NukiLockComponent::set_security_pin(uint32_t new_pin) {
-    ESP_LOGI(TAG, "Setting security pin: %" PRIu32, new_pin);
+    ESP_LOGI(TAG, "Setting security pin");
 
     if (new_pin > 999999) {
         ESP_LOGE(TAG, "Invalid pin: %" PRIu32 " (max. 6 digits/999999) - abort.", new_pin);
@@ -894,6 +1085,8 @@ void NukiLockComponent::set_security_pin(uint32_t new_pin) {
         ESP_LOGI(TAG, "Clearing security pin override");
     }
     this->security_pin_ = new_pin;
+
+    this->publish_security_pin();
 
     const uint32_t pin_to_use = this->security_pin_ != 0 ? this->security_pin_ : this->security_pin_config_.value_or(0);
 
@@ -1034,6 +1227,10 @@ void NukiLockComponent::loop()
     // Unlike the Nuki-protocol work below, this runs on every single call, not gated to
     // 500ms, since BLE connection state benefits from being processed promptly.
     this->nuki_lock_.loop();
+    if (this->bridge_) {
+        this->bridge_->loop();
+    }
+
 
     // Throttle to every 500ms while idle - there's nothing to gain from running this any
     // faster when there's no operation in flight. But while a Nuki BLE operation is active,
@@ -1043,10 +1240,19 @@ void NukiLockComponent::loop()
     // more often (50ms) in that case so multi-step handshakes progress close to BLE speed.
     uint32_t current_time = millis();
     uint32_t loop_interval = this->nuki_op_active_ ? 50 : 500;
+#ifdef USE_BINARY_SENSOR
+    // The lock can hold the latch back after an unlatch until it hears the door open.
+    if (this->door_report_due()) {
+        loop_interval = 0;
+    }
+#endif
     if (current_time - this->last_loop_time_ < loop_interval) {
         return;
     }
     this->last_loop_time_ = current_time;
+
+    this->publish_bluetooth_status();
+    this->publish_lock_reachable();
 
     // Advertisements are now scanned by esp32_ble_tracker (configured by the user's own
     // esp32_ble_tracker: block) and delivered via NukiBle::parse_device(), so there is no
@@ -1064,7 +1270,11 @@ void NukiLockComponent::loop()
     // Once a Nuki BLE operation is in flight (nuki_op_active_), it must keep being
     // re-driven every tick regardless of the cooldown below - the cooldown only applies
     // *between* completed operations, never while one is still working towards a result.
-    if (!this->nuki_op_active_ && millis() - last_command_executed_time_ < command_cooldown_millis) {
+    bool skip_cooldown = false;
+#ifdef USE_BINARY_SENSOR
+    skip_cooldown = this->door_report_due();
+#endif
+    if (!this->nuki_op_active_ && !skip_cooldown && millis() - last_command_executed_time_ < command_cooldown_millis) {
         // Give the lock time to terminate the previous command
         uint64_t millisSinceLastExecution = millis() - last_command_executed_time_;
         uint64_t millisLeft = (millisSinceLastExecution < command_cooldown_millis) ? command_cooldown_millis - millisSinceLastExecution : 1;
@@ -1076,15 +1286,32 @@ void NukiLockComponent::loop()
         // Only one Nuki BLE command can be in flight at a time. Whichever operation is
         // already active keeps being re-invoked (regardless of which other flags below
         // are also true) until it reaches a terminal result; only then can a new
-        // operation be picked, in priority order: PIN validation, lock actions, queued
+        // operation be picked, in priority order: PIN validation, door report, lock actions, queued
         // entity/service commands, then the various periodic polls.
         bool idle = false;
+        if (!this->nuki_op_active_) {
+            this->door_report_in_flight_ = false;  // in case the report was cut short elsewhere
+            this->nuki_op_started_at_ = 0;
+        } else if (this->nuki_op_started_at_ == 0) {
+            this->nuki_op_started_at_ = millis() | 1;
+        }
         if (this->nuki_op_active_) {
             this->nuki_op_step_();
         } else if (this->pin_validation_pending_) {
             this->nuki_op_active_ = true;
             this->nuki_op_step_ = [this] { this->validate_pin_step(); };
             this->nuki_op_step_();
+        } else if (bool door_open; this->door_report_due() && this->door_report_next(&door_open) &&
+                   !this->nuki_lock_.relay_in_progress() && !(this->bridge_ && this->bridge_->relay_pending()) &&
+                   !this->door_report_held(door_open)) {
+            // Door reports go before our own commands, but after the app's (relayed) ones.
+            ESP_LOGD(TAG, "Reporting door sensor state...");
+            this->door_report_retry_at_ = 0;
+            this->door_sensor_report_sending_open_ = door_open;
+            this->nuki_op_active_ = true;
+            this->nuki_op_step_ = [this] { this->report_door_sensor_step(); };
+            this->nuki_op_step_();
+            command_cooldown_millis = COOLDOWN_COMMANDS_MILLIS;
         } else if (this->action_attempts_ > 0) {
             this->nuki_op_active_ = true;
             this->nuki_op_step_ = [this] { this->execute_lock_action_step(); };
@@ -1096,14 +1323,8 @@ void NukiLockComponent::loop()
             this->nuki_op_step_();
             // command_cooldown_millis is set by process_pending_nuki_command() itself -
             // it differs between success, a retry-after-failure, and exhausted retries.
-        } else if (this->door_sensor_report_pending_) {
-            ESP_LOGD(TAG, "Reporting door sensor state...");
-            this->door_sensor_report_sending_open_ = this->door_sensor_report_open_;
-            this->door_sensor_report_pending_ = false;
-            this->nuki_op_active_ = true;
-            this->nuki_op_step_ = [this] { this->report_door_sensor_step(); };
-            this->nuki_op_step_();
-            command_cooldown_millis = COOLDOWN_COMMANDS_MILLIS;
+        } else if (this->nuki_lock_.is_relay_busy()) {
+            // The app is talking to the lock through the cloud; polls wait until it is done.
         } else if (this->status_update_) {
             ESP_LOGD(TAG, "Requesting status...");
             this->nuki_op_active_ = true;
@@ -1176,6 +1397,12 @@ void NukiLockComponent::loop()
             // Pair Nuki (pair_nuki() performs one step per call and reports progress via
             // its return value, so this does not block loop() while pairing is ongoing)
             AuthorizationIdType type = this->pairing_as_app_.value_or(false) ? AuthorizationIdType::App : AuthorizationIdType::Bridge;
+            if (type == AuthorizationIdType::Bridge && this->bridge_ != nullptr && this->bridge_->get_bridge_id() != 0) {
+                // Pair as the cloud bridge itself, named like a Bridge v2 ("Nuki_Bridge_%08X").
+                char name[24];
+                snprintf(name, sizeof(name), "Nuki_Bridge_%08" PRIX32, this->bridge_->get_bridge_id());
+                this->nuki_lock_.set_pairing_identity(this->bridge_->get_bridge_id(), name);
+            }
 
             App.feed_wdt();
 
@@ -1250,10 +1477,10 @@ void NukiLockComponent::setup() {
     uint32_t pin_to_use = 0;
     if (this->security_pin_ != 0) {
         ESP_LOGW(TAG, "Note: Using security pin override, not yaml config pin!");
-        ESP_LOGD(TAG, "Security pin: %" PRIu32 " (override)", this->security_pin_);
+        ESP_LOGD(TAG, "Security pin: override");
         pin_to_use = this->security_pin_;
     } else if(this->security_pin_config_.value_or(0) != 0) {
-        ESP_LOGD(TAG, "Security pin: %" PRIu32 " (yaml config)", this->security_pin_config_.value_or(0));
+        ESP_LOGD(TAG, "Security pin: yaml config");
         pin_to_use = this->security_pin_config_.value_or(0);
     } else {
         this->pin_state_ = PinState::NotSet;
@@ -1266,10 +1493,13 @@ void NukiLockComponent::setup() {
             this->pin_state_ = PinState::Invalid;
             this->save_settings();
         } else {
-            ESP_LOGD(TAG, "Set security pin before init: %" PRIu32, pin_to_use);
+            ESP_LOGD(TAG, "Set security pin before init");
+            this->nuki_lock_.save_security_pincode(static_cast<uint16_t>(pin_to_use));
             this->nuki_lock_.save_ultra_pincode((unsigned int)pin_to_use, false);
         }
     }
+
+    this->publish_security_pin();
 
     this->nuki_lock_.set_debug_connect(this->debug_connect_);
     this->nuki_lock_.set_debug_communication(this->debug_communication_);
@@ -1296,14 +1526,25 @@ void NukiLockComponent::setup() {
     // has its state (set up before us) is reported right away.
     if (this->door_sensor_input_ != nullptr) {
         this->door_sensor_input_->add_full_state_callback([this](optional<bool> previous, optional<bool> current) {
-            if (current.has_value()) {
-                this->door_sensor_report_open_ = *current;
-                this->door_sensor_report_pending_ = true;
+            if (!current.has_value()) {
+                return;
+            }
+            bool changed = previous.has_value() && *previous != *current;
+            this->door_sensor_report_open_ = *current;
+            if (*current) {
+                // The lock re-latches on this transition: it must hear OPEN even if the door
+                // closes again before the report lands.
+                this->door_report_open_owed_ = true;
+            }
+            if (changed) {
+                // A new door event goes out now, not after a pending retry delay
+                this->door_report_retry_at_ = 0;
+                this->door_report_retries_used_ = 0;
+                this->door_report_failing_since_ = 0;
             }
         });
         if (this->door_sensor_input_->has_state()) {
             this->door_sensor_report_open_ = this->door_sensor_input_->state;
-            this->door_sensor_report_pending_ = true;
         }
     }
     #endif
@@ -1353,6 +1594,10 @@ void NukiLockComponent::setup() {
             this->paired_binary_sensor_->publish_state(false);
         }
         #endif
+    }
+
+    if (this->bridge_) {
+        this->bridge_->setup();
     }
 }
 
@@ -1557,7 +1802,9 @@ void NukiLockComponent::dump_config() {
     #endif
     #endif
     #ifdef USE_TEXT_SENSOR
+    LOG_TEXT_SENSOR(TAG, "Bluetooth Status", this->bluetooth_status_text_sensor_);
     LOG_TEXT_SENSOR(TAG, "Door Sensor State", this->door_sensor_state_text_sensor_);
+    LOG_TEXT_SENSOR(TAG, "Lock State", this->lock_state_text_sensor_);
     LOG_TEXT_SENSOR(TAG, "Last Unlock User", this->last_unlock_user_text_sensor_);
     LOG_TEXT_SENSOR(TAG, "Last Lock Action", this->last_lock_action_text_sensor_);
     LOG_TEXT_SENSOR(TAG, "Last Lock Action Trigger", this->last_lock_action_trigger_text_sensor_);
@@ -1571,12 +1818,15 @@ void NukiLockComponent::dump_config() {
     LOG_SENSOR(TAG, "Battery Voltage", this->battery_voltage_sensor_);
     LOG_SENSOR(TAG, "Battery Drain", this->battery_drain_sensor_);
     LOG_SENSOR(TAG, "Motor Current", this->motor_current_sensor_);
+    LOG_SENSOR(TAG, "Lock Distance", this->lock_distance_sensor_);
     LOG_SENSOR(TAG, "Bluetooth Signal", this->bt_signal_sensor_);
     LOG_SENSOR(TAG, "WiFi Connection Strength", this->wifi_connection_strength_sensor_);
     #endif
     #ifdef USE_BUTTON
     LOG_BUTTON(TAG, "Unpair", this->unpair_button_);
     LOG_BUTTON(TAG, "Request Calibration", this->request_calibration_button_);
+    LOG_BUTTON(TAG, "Pair Bridge", this->pair_bridge_button_);
+    LOG_BUTTON(TAG, "Pair Lock", this->pair_lock_button_);
     #endif
     #ifdef USE_SWITCH
     LOG_SWITCH(TAG, "Pairing Mode", this->pairing_mode_switch_);
@@ -1599,6 +1849,9 @@ void NukiLockComponent::dump_config() {
     LOG_SWITCH(TAG, "Logging Enabled", this->logging_enabled_switch_);
     #endif
     #ifdef USE_NUMBER
+    #ifdef USE_TEXT
+    LOG_TEXT(TAG, "Security PIN", this->security_pin_text_);
+    #endif
     LOG_NUMBER(TAG, "LED Brightness", this->led_brightness_number_);
     LOG_NUMBER(TAG, "Timezone Offset", this->timezone_offset_number_);
     LOG_NUMBER(TAG, "LockNGo Timeout", this->lock_n_go_timeout_number_);
@@ -1620,6 +1873,10 @@ void NukiLockComponent::dump_config() {
     LOG_SELECT(TAG, "Battery Type", this->battery_type_select_);
     LOG_SELECT(TAG, "Motor Speed", this->motor_speed_select_);
     #endif
+
+    if (this->bridge_) {
+        this->bridge_->dump_config();
+    }
 }
 
 void NukiLockComponent::notify(EventType event_type) {
@@ -1632,10 +1889,10 @@ void NukiLockComponent::notify(EventType event_type) {
         // Invalid Pin
         ESP_LOGW(TAG, "Nuki reported an invalid security PIN");
 
-        ESP_LOGD(TAG, "NVS PIN 1st-4th Gen: %d", this->nuki_lock_.get_security_pincode());
-        ESP_LOGD(TAG, "NVS PIN 5th Gen (Ultra / Go / Pro): %" PRIu32, this->nuki_lock_.get_ultra_pincode());
-        ESP_LOGD(TAG, "ESPHome PIN (override): %" PRIu32, this->security_pin_);
-        ESP_LOGD(TAG, "ESPHome PIN (YAML): %" PRIu32, this->security_pin_config_.value_or(0));
+        ESP_LOGD(TAG, "NVS PIN 1st-4th Gen: %s", this->nuki_lock_.get_security_pincode() != 0 ? "set" : "not set");
+        ESP_LOGD(TAG, "NVS PIN 5th Gen (Ultra / Go / Pro): %s", this->nuki_lock_.get_ultra_pincode() != 0 ? "set" : "not set");
+        ESP_LOGD(TAG, "ESPHome PIN (override): %s", this->security_pin_ != 0 ? "set" : "not set");
+        ESP_LOGD(TAG, "ESPHome PIN (YAML): %s", this->security_pin_config_.value_or(0) != 0 ? "set" : "not set");
 
         const uint32_t saved_pin = this->nuki_lock_.is_lock_ultra() ? this->nuki_lock_.get_ultra_pincode() : this->nuki_lock_.get_security_pincode();
         const uint32_t actual_pin = this->security_pin_ != 0 ? this->security_pin_ : this->security_pin_config_.value_or(0);
@@ -1649,6 +1906,16 @@ void NukiLockComponent::notify(EventType event_type) {
         this->publish_pin_state();
     } else if(event_type == EventType::KeyTurnerStatusUpdated) {
         ESP_LOGD(TAG, "KeyTurnerStatusUpdated");
+
+#ifdef USE_BINARY_SENSOR
+        // The lock's state moved on (e.g. the motor stopped), so it may take the report now.
+        if (this->door_report_retry_at_ != 0) {
+            this->door_report_retry_at_ = millis() | 1;
+        }
+#endif
+        if (this->bridge_) {
+            this->bridge_->send_keyturner_event();
+        }
 
         if ((int32_t)(millis() - this->ignore_status_beacon_until_) < 0) {
             // Flags the state change of our own lock action, already published from the
@@ -1765,10 +2032,10 @@ void NukiLockComponent::set_pairing_mode(bool enabled) {
             ESP_LOGW(TAG, "Note: The security pin is crucial to pair a 5th Gen Smart Lock (Ultra / Go / Pro) but is currently not set.");
         }
 
-        ESP_LOGD(TAG, "NVS PIN 1st-4th Gen: %d", this->nuki_lock_.get_security_pincode());
-        ESP_LOGD(TAG, "NVS PIN 5th Gen (Ultra / Go / Pro): %" PRIu32, this->nuki_lock_.get_ultra_pincode());
-        ESP_LOGD(TAG, "ESPHome PIN (override): %" PRIu32, this->security_pin_);
-        ESP_LOGD(TAG, "ESPHome PIN (YAML): %" PRIu32, this->security_pin_config_.value_or(0));
+        ESP_LOGD(TAG, "NVS PIN 1st-4th Gen: %s", this->nuki_lock_.get_security_pincode() != 0 ? "set" : "not set");
+        ESP_LOGD(TAG, "NVS PIN 5th Gen (Ultra / Go / Pro): %s", this->nuki_lock_.get_ultra_pincode() != 0 ? "set" : "not set");
+        ESP_LOGD(TAG, "ESPHome PIN (override): %s", this->security_pin_ != 0 ? "set" : "not set");
+        ESP_LOGD(TAG, "ESPHome PIN (YAML): %s", this->security_pin_config_.value_or(0) != 0 ? "set" : "not set");
 
         ESP_LOGI(TAG, "Waiting for Nuki to enter pairing mode...");
 
@@ -1781,6 +2048,43 @@ void NukiLockComponent::set_pairing_mode(bool enabled) {
         ESP_LOGI(TAG, "Pairing Mode turned off");
         this->pairing_mode_off_callback_.call();
     }
+    this->publish_bluetooth_status();
+}
+
+std::string NukiLockComponent::get_bluetooth_status() {
+    if (!this->nuki_lock_.is_paired_with_lock()) {
+        if (this->pairing_mode_) {
+            return "pairing";
+        }
+        return "unpaired";
+    }
+    if (this->pairing_mode_) {
+        return "pairing";
+    }
+    if (this->nuki_lock_.connected()) {
+        return "connected";
+    }
+    auto ble_st = this->nuki_lock_.state();
+    if (ble_st == esphome::esp32_ble_tracker::ClientState::CONNECTING ||
+        ble_st == esphome::esp32_ble_tracker::ClientState::DISCOVERED) {
+        return "connecting";
+    }
+    if (this->connected_) {
+        return "idle";
+    }
+    return "disconnected";
+}
+
+void NukiLockComponent::publish_bluetooth_status() {
+#ifdef USE_TEXT_SENSOR
+    if (this->bluetooth_status_text_sensor_ != nullptr) {
+        std::string current_st = this->get_bluetooth_status();
+        if (current_st != this->last_published_bt_status_) {
+            this->last_published_bt_status_ = current_st;
+            this->bluetooth_status_text_sensor_->publish_state(current_st);
+        }
+    }
+#endif
 }
 
 #ifdef USE_BUTTON
@@ -1791,80 +2095,58 @@ void NukiLockUnpairButton::press_action() {
 void NukiLockRequestCalibrationButton::press_action() {
     this->parent_->request_calibration();
 }
+
+void NukiLockPairBridgeButton::press_action() {
+    this->parent_->register_bridge();
+}
+
+void NukiLockPairLockButton::press_action() {
+    ESP_LOGI(TAG, "Pair Lock button pressed - activating lock pairing mode");
+    // Re-pairing replaces the current pairing, so there is no separate unpair step.
+    if (this->parent_->is_paired()) {
+        this->parent_->unpair();
+    }
+    this->parent_->set_pairing_mode(true);
+}
 #endif
 
 #ifdef USE_SELECT
 void NukiLockSingleButtonPressActionSelect::control(const std::string &value) {
     ButtonPressAction action = nuki_lock::button_press_action_to_enum(value.c_str());
-    this->parent_->queue_nuki_command([this, action] { return this->parent_->get_nuki_lock()->set_single_button_press_action(action); }, [this, action, value](CmdResult result) {
-        if (result == CmdResult::Success) {
-            this->parent_->get_nuki_lock_advanced_config()->singleButtonPressAction = action;
-            this->publish_state(value.c_str());
-        }
-    });
+    this->parent_->queue_nuki_command([this, action] { return this->parent_->get_nuki_lock()->set_single_button_press_action(action); }, [this](CmdResult) { this->parent_->request_advanced_config_read(); });
 }
 
 void NukiLockDoubleButtonPressActionSelect::control(const std::string &value) {
     ButtonPressAction action = nuki_lock::button_press_action_to_enum(value.c_str());
-    this->parent_->queue_nuki_command([this, action] { return this->parent_->get_nuki_lock()->set_double_button_press_action(action); }, [this, action, value](CmdResult result) {
-        if (result == CmdResult::Success) {
-            this->parent_->get_nuki_lock_advanced_config()->doubleButtonPressAction = action;
-            this->publish_state(value.c_str());
-        }
-    });
+    this->parent_->queue_nuki_command([this, action] { return this->parent_->get_nuki_lock()->set_double_button_press_action(action); }, [this](CmdResult) { this->parent_->request_advanced_config_read(); });
 }
 
 void NukiLockFobAction1Select::control(const std::string &value) {
     const uint8_t action = nuki_lock::fob_action_to_int(value.c_str());
     if (action == 99) return;
-    this->parent_->queue_nuki_command([this, action] { return this->parent_->get_nuki_lock()->set_fob_action(1, action); }, [this, action, value](CmdResult result) {
-        if (result == CmdResult::Success) {
-            this->parent_->get_nuki_lock_config()->fobAction1 = action;
-            this->publish_state(value.c_str());
-        }
-    });
+    this->parent_->queue_nuki_command([this, action] { return this->parent_->get_nuki_lock()->set_fob_action(1, action); }, [this](CmdResult) { this->parent_->request_config_read(); });
 }
 
 void NukiLockFobAction2Select::control(const std::string &value) {
     const uint8_t action = nuki_lock::fob_action_to_int(value.c_str());
     if (action == 99) return;
-    this->parent_->queue_nuki_command([this, action] { return this->parent_->get_nuki_lock()->set_fob_action(2, action); }, [this, action, value](CmdResult result) {
-        if (result == CmdResult::Success) {
-            this->parent_->get_nuki_lock_config()->fobAction2 = action;
-            this->publish_state(value.c_str());
-        }
-    });
+    this->parent_->queue_nuki_command([this, action] { return this->parent_->get_nuki_lock()->set_fob_action(2, action); }, [this](CmdResult) { this->parent_->request_config_read(); });
 }
 
 void NukiLockFobAction3Select::control(const std::string &value) {
     const uint8_t action = nuki_lock::fob_action_to_int(value.c_str());
     if (action == 99) return;
-    this->parent_->queue_nuki_command([this, action] { return this->parent_->get_nuki_lock()->set_fob_action(3, action); }, [this, action, value](CmdResult result) {
-        if (result == CmdResult::Success) {
-            this->parent_->get_nuki_lock_config()->fobAction3 = action;
-            this->publish_state(value.c_str());
-        }
-    });
+    this->parent_->queue_nuki_command([this, action] { return this->parent_->get_nuki_lock()->set_fob_action(3, action); }, [this](CmdResult) { this->parent_->request_config_read(); });
 }
 
 void NukiLockTimeZoneSelect::control(const std::string &value) {
     TimeZoneId tzid = nuki_lock::timezone_to_enum(value.c_str());
-    this->parent_->queue_nuki_command([this, tzid] { return this->parent_->get_nuki_lock()->set_time_zone_id(tzid); }, [this, tzid, value](CmdResult result) {
-        if (result == CmdResult::Success) {
-            this->parent_->get_nuki_lock_config()->timeZoneId = tzid;
-            this->publish_state(value.c_str());
-        }
-    });
+    this->parent_->queue_nuki_command([this, tzid] { return this->parent_->get_nuki_lock()->set_time_zone_id(tzid); }, [this](CmdResult) { this->parent_->request_config_read(); });
 }
 
 void NukiLockAdvertisingModeSelect::control(const std::string &value) {
     AdvertisingMode mode = nuki_lock::advertising_mode_to_enum(value.c_str());
-    this->parent_->queue_nuki_command([this, mode] { return this->parent_->get_nuki_lock()->set_advertising_mode(mode); }, [this, mode, value](CmdResult result) {
-        if (result == CmdResult::Success) {
-            this->parent_->get_nuki_lock_config()->advertisingMode = mode;
-            this->publish_state(value.c_str());
-        }
-    });
+    this->parent_->queue_nuki_command([this, mode] { return this->parent_->get_nuki_lock()->set_advertising_mode(mode); }, [this](CmdResult) { this->parent_->request_config_read(); });
 }
 
 void NukiLockBatteryTypeSelect::control(const std::string &value) {
@@ -1873,12 +2155,7 @@ void NukiLockBatteryTypeSelect::control(const std::string &value) {
         return;
     }
     BatteryType type = nuki_lock::battery_type_to_enum(value.c_str());
-    this->parent_->queue_nuki_command([this, type] { return this->parent_->get_nuki_lock()->set_battery_type(type); }, [this, type, value](CmdResult result) {
-        if (result == CmdResult::Success) {
-            this->parent_->get_nuki_lock_advanced_config()->batteryType = type;
-            this->publish_state(value.c_str());
-        }
-    });
+    this->parent_->queue_nuki_command([this, type] { return this->parent_->get_nuki_lock()->set_battery_type(type); }, [this](CmdResult) { this->parent_->request_advanced_config_read(); });
 }
 
 void NukiLockMotorSpeedSelect::control(const std::string &value) {
@@ -1887,12 +2164,7 @@ void NukiLockMotorSpeedSelect::control(const std::string &value) {
         return;
     }
     MotorSpeed speed = nuki_lock::motor_speed_to_enum(value.c_str());
-    this->parent_->queue_nuki_command([this, speed] { return this->parent_->get_nuki_lock()->set_motor_speed(speed); }, [this, speed, value](CmdResult result) {
-        if (result == CmdResult::Success) {
-            this->parent_->get_nuki_lock_advanced_config()->motorSpeed = speed;
-            this->publish_state(value.c_str());
-        }
-    });
+    this->parent_->queue_nuki_command([this, speed] { return this->parent_->get_nuki_lock()->set_motor_speed(speed); }, [this](CmdResult) { this->parent_->request_advanced_config_read(); });
 }
 #endif
 
@@ -1902,129 +2174,59 @@ void NukiLockPairingModeSwitch::write_state(bool state) {
 }
 
 void NukiLockBluetoothPairingEnabledSwitch::write_state(bool state) {
-    this->parent_->queue_nuki_command([this, state] { return this->parent_->get_nuki_lock()->enable_pairing(state); }, [this, state](CmdResult result) {
-        if (result == CmdResult::Success) {
-            this->parent_->get_nuki_lock_config()->pairing_enabled = state;
-            this->publish_state(state);
-        }
-    });
+    this->parent_->queue_nuki_command([this, state] { return this->parent_->get_nuki_lock()->enable_pairing(state); }, [this](CmdResult) { this->parent_->request_config_read(); });
 }
 
 void NukiLockAutoUnlatchEnabledSwitch::write_state(bool state) {
-    this->parent_->queue_nuki_command([this, state] { return this->parent_->get_nuki_lock()->enable_auto_unlatch(state); }, [this, state](CmdResult result) {
-        if (result == CmdResult::Success) {
-            this->parent_->get_nuki_lock_config()->autoUnlatch = state;
-            this->publish_state(state);
-        }
-    });
+    this->parent_->queue_nuki_command([this, state] { return this->parent_->get_nuki_lock()->enable_auto_unlatch(state); }, [this](CmdResult) { this->parent_->request_config_read(); });
 }
 
 void NukiLockButtonEnabledSwitch::write_state(bool state) {
-    this->parent_->queue_nuki_command([this, state] { return this->parent_->get_nuki_lock()->enable_button(state); }, [this, state](CmdResult result) {
-        if (result == CmdResult::Success) {
-            this->parent_->get_nuki_lock_config()->buttonEnabled = state;
-            this->publish_state(state);
-        }
-    });
+    this->parent_->queue_nuki_command([this, state] { return this->parent_->get_nuki_lock()->enable_button(state); }, [this](CmdResult) { this->parent_->request_config_read(); });
 }
 
 void NukiLockLedEnabledSwitch::write_state(bool state) {
-    this->parent_->queue_nuki_command([this, state] { return this->parent_->get_nuki_lock()->enable_led_flash(state); }, [this, state](CmdResult result) {
-        if (result == CmdResult::Success) {
-            this->parent_->get_nuki_lock_config()->ledEnabled = state;
-            this->publish_state(state);
-        }
-    });
+    this->parent_->queue_nuki_command([this, state] { return this->parent_->get_nuki_lock()->enable_led_flash(state); }, [this](CmdResult) { this->parent_->request_config_read(); });
 }
 
 void NukiLockNightModeEnabledSwitch::write_state(bool state) {
-    this->parent_->queue_nuki_command([this, state] { return this->parent_->get_nuki_lock()->enable_night_mode(state); }, [this, state](CmdResult result) {
-        if (result == CmdResult::Success) {
-            this->parent_->get_nuki_lock_advanced_config()->nightModeEnabled = state;
-            this->publish_state(state);
-        }
-    });
+    this->parent_->queue_nuki_command([this, state] { return this->parent_->get_nuki_lock()->enable_night_mode(state); }, [this](CmdResult) { this->parent_->request_advanced_config_read(); });
 }
 
 void NukiLockNightModeAutoLockEnabledSwitch::write_state(bool state) {
-    this->parent_->queue_nuki_command([this, state] { return this->parent_->get_nuki_lock()->enable_night_mode_auto_lock(state); }, [this, state](CmdResult result) {
-        if (result == CmdResult::Success) {
-            this->parent_->get_nuki_lock_advanced_config()->nightModeAutoLockEnabled = state;
-            this->publish_state(state);
-        }
-    });
+    this->parent_->queue_nuki_command([this, state] { return this->parent_->get_nuki_lock()->enable_night_mode_auto_lock(state); }, [this](CmdResult) { this->parent_->request_advanced_config_read(); });
 }
 
 void NukiLockNightModeAutoUnlockDisabledSwitch::write_state(bool state) {
-    this->parent_->queue_nuki_command([this, state] { return this->parent_->get_nuki_lock()->disable_night_mode_auto_unlock(state); }, [this, state](CmdResult result) {
-        if (result == CmdResult::Success) {
-            this->parent_->get_nuki_lock_advanced_config()->nightModeAutoUnlockDisabled = state;
-            this->publish_state(state);
-        }
-    });
+    this->parent_->queue_nuki_command([this, state] { return this->parent_->get_nuki_lock()->disable_night_mode_auto_unlock(state); }, [this](CmdResult) { this->parent_->request_advanced_config_read(); });
 }
 
 void NukiLockNightModeImmediateLockOnStartEnabledSwitch::write_state(bool state) {
-    this->parent_->queue_nuki_command([this, state] { return this->parent_->get_nuki_lock()->enable_night_mode_immediate_lock_on_start(state); }, [this, state](CmdResult result) {
-        if (result == CmdResult::Success) {
-            this->parent_->get_nuki_lock_advanced_config()->nightModeImmediateLockOnStart = state;
-            this->publish_state(state);
-        }
-    });
+    this->parent_->queue_nuki_command([this, state] { return this->parent_->get_nuki_lock()->enable_night_mode_immediate_lock_on_start(state); }, [this](CmdResult) { this->parent_->request_advanced_config_read(); });
 }
 
 void NukiLockAutoLockEnabledSwitch::write_state(bool state) {
-    this->parent_->queue_nuki_command([this, state] { return this->parent_->get_nuki_lock()->enable_auto_lock(state); }, [this, state](CmdResult result) {
-        if (result == CmdResult::Success) {
-            this->parent_->get_nuki_lock_advanced_config()->autoLockEnabled = state;
-            this->publish_state(state);
-        }
-    });
+    this->parent_->queue_nuki_command([this, state] { return this->parent_->get_nuki_lock()->enable_auto_lock(state); }, [this](CmdResult) { this->parent_->request_advanced_config_read(); });
 }
 
 void NukiLockAutoUnlockDisabledSwitch::write_state(bool state) {
-    this->parent_->queue_nuki_command([this, state] { return this->parent_->get_nuki_lock()->disable_auto_unlock(state); }, [this, state](CmdResult result) {
-        if (result == CmdResult::Success) {
-            this->parent_->get_nuki_lock_advanced_config()->autoUnLockDisabled = state;
-            this->publish_state(state);
-        }
-    });
+    this->parent_->queue_nuki_command([this, state] { return this->parent_->get_nuki_lock()->disable_auto_unlock(state); }, [this](CmdResult) { this->parent_->request_advanced_config_read(); });
 }
 
 void NukiLockImmediateAutoLockEnabledSwitch::write_state(bool state) {
-    this->parent_->queue_nuki_command([this, state] { return this->parent_->get_nuki_lock()->enable_immediate_auto_lock(state); }, [this, state](CmdResult result) {
-        if (result == CmdResult::Success) {
-            this->parent_->get_nuki_lock_advanced_config()->immediateAutoLockEnabled = state;
-            this->publish_state(state);
-        }
-    });
+    this->parent_->queue_nuki_command([this, state] { return this->parent_->get_nuki_lock()->enable_immediate_auto_lock(state); }, [this](CmdResult) { this->parent_->request_advanced_config_read(); });
 }
 
 void NukiLockAutoUpdateEnabledSwitch::write_state(bool state) {
-    this->parent_->queue_nuki_command([this, state] { return this->parent_->get_nuki_lock()->enable_auto_update(state); }, [this, state](CmdResult result) {
-        if (result == CmdResult::Success) {
-            this->parent_->get_nuki_lock_advanced_config()->autoUpdateEnabled = state;
-            this->publish_state(state);
-        }
-    });
+    this->parent_->queue_nuki_command([this, state] { return this->parent_->get_nuki_lock()->enable_auto_update(state); }, [this](CmdResult) { this->parent_->request_advanced_config_read(); });
 }
 
 void NukiLockSingleLockEnabledSwitch::write_state(bool state) {
-    this->parent_->queue_nuki_command([this, state] { return this->parent_->get_nuki_lock()->enable_single_lock(state); }, [this, state](CmdResult result) {
-        if (result == CmdResult::Success) {
-            this->parent_->get_nuki_lock_config()->singleLock = state;
-            this->publish_state(state);
-        }
-    });
+    this->parent_->queue_nuki_command([this, state] { return this->parent_->get_nuki_lock()->enable_single_lock(state); }, [this](CmdResult) { this->parent_->request_config_read(); });
 }
 
 void NukiLockDstModeEnabledSwitch::write_state(bool state) {
-    this->parent_->queue_nuki_command([this, state] { return this->parent_->get_nuki_lock()->enable_dst(state); }, [this, state](CmdResult result) {
-        if (result == CmdResult::Success) {
-            this->parent_->get_nuki_lock_config()->dstMode = state;
-            this->publish_state(state);
-        }
-    });
+    this->parent_->queue_nuki_command([this, state] { return this->parent_->get_nuki_lock()->enable_dst(state); }, [this](CmdResult) { this->parent_->request_config_read(); });
 }
 
 void NukiLockAutoBatteryTypeDetectionEnabledSwitch::write_state(bool state) {
@@ -2032,12 +2234,7 @@ void NukiLockAutoBatteryTypeDetectionEnabledSwitch::write_state(bool state) {
         ESP_LOGE(TAG, "Auto Battery Type Detection is not supported for 5th Gen Smart Locks (Ultra / Go / Pro)");
         return;
     }
-    this->parent_->queue_nuki_command([this, state] { return this->parent_->get_nuki_lock()->enable_auto_battery_type_detection(state); }, [this, state](CmdResult result) {
-        if (result == CmdResult::Success) {
-            this->parent_->get_nuki_lock_advanced_config()->automaticBatteryTypeDetection = state;
-            this->publish_state(state);
-        }
-    });
+    this->parent_->queue_nuki_command([this, state] { return this->parent_->get_nuki_lock()->enable_auto_battery_type_detection(state); }, [this](CmdResult) { this->parent_->request_advanced_config_read(); });
 }
 
 void NukiLockSlowSpeedDuringNightModeEnabledSwitch::write_state(bool state) {
@@ -2045,20 +2242,10 @@ void NukiLockSlowSpeedDuringNightModeEnabledSwitch::write_state(bool state) {
         ESP_LOGE(TAG, "Slow Speed During Night Mode is only supported for 5th Gen Smart Locks (Ultra / Go / Pro)");
         return;
     }
-    this->parent_->queue_nuki_command([this, state] { return this->parent_->get_nuki_lock()->enable_slow_speed_during_night_mode(state); }, [this, state](CmdResult result) {
-        if (result == CmdResult::Success) {
-            this->parent_->get_nuki_lock_advanced_config()->enable_slow_speed_during_night_mode = state;
-            this->publish_state(state);
-        }
-    });
+    this->parent_->queue_nuki_command([this, state] { return this->parent_->get_nuki_lock()->enable_slow_speed_during_night_mode(state); }, [this](CmdResult) { this->parent_->request_advanced_config_read(); });
 }
 void NukiLockDetachedCylinderEnabledSwitch::write_state(bool state) {
-    this->parent_->queue_nuki_command([this, state] { return this->parent_->get_nuki_lock()->enable_detached_cylinder(state); }, [this, state](CmdResult result) {
-        if (result == CmdResult::Success) {
-            this->parent_->get_nuki_lock_advanced_config()->detachedCylinder = state;
-            this->publish_state(state);
-        }
-    });
+    this->parent_->queue_nuki_command([this, state] { return this->parent_->get_nuki_lock()->enable_detached_cylinder(state); }, [this](CmdResult) { this->parent_->request_advanced_config_read(); });
 }
 void NukiLockLoggingEnabledSwitch::write_state(bool state) {
     this->parent_->queue_nuki_command([this, state] { return this->parent_->get_nuki_lock()->enable_logging(state); }, [this, state](CmdResult result) {
@@ -2069,86 +2256,54 @@ void NukiLockLoggingEnabledSwitch::write_state(bool state) {
 }
 #endif
 
+#ifdef USE_TEXT
+void NukiLockSecurityPinText::control(const std::string &value) {
+    if (value == SECURITY_PIN_MASK) return;
+    // Empty clears the override, falling back to the YAML pin.
+    if (value.size() > 6 || value.find_first_not_of("0123456789") != std::string::npos) {
+        ESP_LOGW(TAG, "Security PIN must be up to 6 digits");
+        this->parent_->publish_security_pin();
+        return;
+    }
+    this->parent_->set_security_pin(value.empty() ? 0 : static_cast<uint32_t>(std::stoul(value)));
+}
+#endif
+
 #ifdef USE_NUMBER
 void NukiLockLedBrightnessNumber::control(float value) {
-    this->parent_->queue_nuki_command([this, value] { return this->parent_->get_nuki_lock()->set_led_brightness(value); }, [this, value](CmdResult result) {
-        if (result == CmdResult::Success) {
-            this->parent_->get_nuki_lock_config()->ledBrightness = value;
-            this->publish_state(value);
-        }
-    });
+    this->parent_->queue_nuki_command([this, value] { return this->parent_->get_nuki_lock()->set_led_brightness(value); }, [this](CmdResult) { this->parent_->request_config_read(); });
 }
 void NukiLockTimeZoneOffsetNumber::control(float value) {
     if (value < -60 || value > 60) return;
-    this->parent_->queue_nuki_command([this, value] { return this->parent_->get_nuki_lock()->set_time_zone_offset(value); }, [this, value](CmdResult result) {
-        if (result == CmdResult::Success) {
-            this->parent_->get_nuki_lock_config()->timeZoneOffset = value;
-            this->publish_state(value);
-        }
-    });
+    this->parent_->queue_nuki_command([this, value] { return this->parent_->get_nuki_lock()->set_time_zone_offset(value); }, [this](CmdResult) { this->parent_->request_config_read(); });
 }
 void NukiLockLockNGoTimeoutNumber::control(float value) {
     if (value < 5 || value > 60) return;
-    this->parent_->queue_nuki_command([this, value] { return this->parent_->get_nuki_lock()->set_lock_ngo_timeout(value); }, [this, value](CmdResult result) {
-        if (result == CmdResult::Success) {
-            this->parent_->get_nuki_lock_advanced_config()->lockNgoTimeout = value;
-            this->publish_state(value);
-        }
-    });
+    this->parent_->queue_nuki_command([this, value] { return this->parent_->get_nuki_lock()->set_lock_ngo_timeout(value); }, [this](CmdResult) { this->parent_->request_advanced_config_read(); });
 }
 void NukiLockAutoLockTimeoutNumber::control(float value) {
     if (value < 30 || value > 1800) return;
-    this->parent_->queue_nuki_command([this, value] { return this->parent_->get_nuki_lock()->set_auto_lock_time_out(value); }, [this, value](CmdResult result) {
-        if (result == CmdResult::Success) {
-            this->parent_->get_nuki_lock_advanced_config()->autoLockTimeOut = value;
-            this->publish_state(value);
-        }
-    });
+    this->parent_->queue_nuki_command([this, value] { return this->parent_->get_nuki_lock()->set_auto_lock_time_out(value); }, [this](CmdResult) { this->parent_->request_advanced_config_read(); });
 }
 void NukiLockUnlatchDurationNumber::control(float value) {
     if (value < 1 || value > 30) return;
-    this->parent_->queue_nuki_command([this, value] { return this->parent_->get_nuki_lock()->set_unlatch_duration(value); }, [this, value](CmdResult result) {
-        if (result == CmdResult::Success) {
-            this->parent_->get_nuki_lock_advanced_config()->unlatchDuration = value;
-            this->publish_state(value);
-        }
-    });
+    this->parent_->queue_nuki_command([this, value] { return this->parent_->get_nuki_lock()->set_unlatch_duration(value); }, [this](CmdResult) { this->parent_->request_advanced_config_read(); });
 }
 void NukiLockUnlockedPositionOffsetDegreesNumber::control(float value) {
     if (value < -90 || value > 180) return;
-    this->parent_->queue_nuki_command([this, value] { return this->parent_->get_nuki_lock()->set_unlocked_position_offset_degrees(value); }, [this, value](CmdResult result) {
-        if (result == CmdResult::Success) {
-            this->parent_->get_nuki_lock_advanced_config()->unlockedPositionOffsetDegrees = value;
-            this->publish_state(value);
-        }
-    });
+    this->parent_->queue_nuki_command([this, value] { return this->parent_->get_nuki_lock()->set_unlocked_position_offset_degrees(value); }, [this](CmdResult) { this->parent_->request_advanced_config_read(); });
 }
 void NukiLockLockedPositionOffsetDegreesNumber::control(float value) {
     if (value < -180 || value > 90) return;
-    this->parent_->queue_nuki_command([this, value] { return this->parent_->get_nuki_lock()->set_locked_position_offset_degrees(value); }, [this, value](CmdResult result) {
-        if (result == CmdResult::Success) {
-            this->parent_->get_nuki_lock_advanced_config()->lockedPositionOffsetDegrees = value;
-            this->publish_state(value);
-        }
-    });
+    this->parent_->queue_nuki_command([this, value] { return this->parent_->get_nuki_lock()->set_locked_position_offset_degrees(value); }, [this](CmdResult) { this->parent_->request_advanced_config_read(); });
 }
 void NukiLockSingleLockedPositionOffsetDegreesNumber::control(float value) {
     if (value < -180 || value > 180) return;
-    this->parent_->queue_nuki_command([this, value] { return this->parent_->get_nuki_lock()->set_single_locked_position_offset_degrees(value); }, [this, value](CmdResult result) {
-        if (result == CmdResult::Success) {
-            this->parent_->get_nuki_lock_advanced_config()->singleLockedPositionOffsetDegrees = value;
-            this->publish_state(value);
-        }
-    });
+    this->parent_->queue_nuki_command([this, value] { return this->parent_->get_nuki_lock()->set_single_locked_position_offset_degrees(value); }, [this](CmdResult) { this->parent_->request_advanced_config_read(); });
 }
 void NukiLockUnlockedToLockedTransitionOffsetDegreesNumber::control(float value) {
     if (value < -180 || value > 180) return;
-    this->parent_->queue_nuki_command([this, value] { return this->parent_->get_nuki_lock()->set_unlocked_to_locked_transition_offset_degrees(value); }, [this, value](CmdResult result) {
-        if (result == CmdResult::Success) {
-            this->parent_->get_nuki_lock_advanced_config()->unlockedToLockedTransitionOffsetDegrees = value;
-            this->publish_state(value);
-        }
-    });
+    this->parent_->queue_nuki_command([this, value] { return this->parent_->get_nuki_lock()->set_unlocked_to_locked_transition_offset_degrees(value); }, [this](CmdResult) { this->parent_->request_advanced_config_read(); });
 }
 #endif
 

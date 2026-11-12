@@ -4,9 +4,15 @@ from esphome.core import CORE
 import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome import automation
-from esphome.components.esp32 import add_idf_component, add_idf_sdkconfig_option, arduino_bundles_libsodium
+from esphome.components.esp32 import (
+    add_idf_component,
+    add_idf_sdkconfig_option,
+    arduino_bundles_libsodium,
+    request_tls,
+    require_full_certificate_bundle,
+)
 from esphome.components.noise import LIBSODIUM_VERSION
-from esphome.components import esp32_ble, esp32_ble_tracker, lock, binary_sensor, text_sensor, sensor, switch, button, number, select
+from esphome.components import esp32_ble, esp32_ble_tracker, lock, binary_sensor, text_sensor, sensor, switch, button, number, select, event, text
 from esphome.components.esp32_ble import BTLoggers
 from esphome.const import (
     CONF_ID,
@@ -37,7 +43,7 @@ DEPENDENCIES = ["esp32_ble_tracker"]
 
 # ESP-IDF component compiling the libsodium modules ESPHome's port leaves out
 NUKI_SODIUM_DIR = Path(__file__).resolve().parent / "nuki_sodium"
-AUTO_LOAD = ["binary_sensor", "text_sensor", "sensor", "switch", "button", "number", "select", "esp32_ble_client"]
+AUTO_LOAD = ["binary_sensor", "text_sensor", "sensor", "switch", "button", "number", "select", "text", "esp32_ble_client", "event"]
 
 CONF_CONNECTED_BINARY_SENSOR = "connected"
 CONF_PAIRED_BINARY_SENSOR = "paired"
@@ -53,9 +59,12 @@ CONF_BATTERY_VOLTAGE_SENSOR = "battery_voltage"
 CONF_BATTERY_DRAIN_SENSOR = "battery_drain"
 CONF_MOTOR_CURRENT_SENSOR = "motor_current"
 CONF_BT_SIGNAL_SENSOR = "bt_signal_strength"
+CONF_BLUETOOTH_STATUS_TEXT_SENSOR = "bluetooth_status"
 CONF_WIFI_CONNECTION_STRENGTH_SENSOR = "wifi_connection_strength"
 
 CONF_DOOR_SENSOR_STATE_TEXT_SENSOR = "door_sensor_state"
+CONF_LOCK_STATE_TEXT_SENSOR = "lock_state"
+CONF_LOCK_DISTANCE_SENSOR = "lock_distance"
 CONF_LAST_UNLOCK_USER_TEXT_SENSOR = "last_unlock_user"
 CONF_LAST_LOCK_ACTION_TEXT_SENSOR = "last_lock_action"
 CONF_LAST_LOCK_ACTION_TRIGGER_TEXT_SENSOR = "last_lock_action_trigger"
@@ -66,6 +75,8 @@ CONF_THREAD_CONNECTION_STATUS_TEXT_SENSOR = "thread_connection_status"
 
 CONF_UNPAIR_BUTTON = "unpair"
 CONF_REQUEST_CALIBRATION_BUTTON = "request_calibration"
+CONF_PAIR_BRIDGE_BUTTON = "pair_bridge"
+CONF_PAIR_LOCK_BUTTON = "pair_lock"
 
 CONF_PAIRING_MODE_SWITCH = "pairing_mode"
 CONF_BLUETOOTH_PAIRING_ENABLED_SWITCH = "bluetooth_pairing_enabled"
@@ -97,6 +108,7 @@ CONF_ADVERTISING_MODE_SELECT = "advertising_mode"
 CONF_BATTERY_TYPE_SELECT = "battery_type"
 CONF_MOTOR_SPEED_SELECT = "motor_speed"
 
+CONF_SECURITY_PIN_TEXT = "security_pin_text"
 CONF_LED_BRIGHTNESS_NUMBER = "led_brightness"
 CONF_TIMEZONE_OFFSET_NUMBER = "timezone_offset"
 CONF_LOCK_N_GO_TIMEOUT_NUMBER = "lock_n_go_timeout"
@@ -222,6 +234,15 @@ CONF_HYBRID_FALLBACK_TIMEOUT = "fallback_timeout"
 CONF_HYBRID_OFFLINE_UPDATE_INTERVAL = "offline_update_interval"
 CONF_HYBRID_CONNECTED_BINARY_SENSOR = "connected"
 
+CONF_BRIDGE = "bridge"
+CONF_HOST_INDEX = "host_index"
+CONF_WS_TOKEN = "ws_token"
+CONF_BRIDGE_ID = "bridge_id"
+CONF_NUKI_ID = "nuki_id"
+CONF_DEVICE_TYPE = "device_type"
+CONF_CLOUD_STATUS = "cloud_status"
+CONF_CLOUD_EVENT = "cloud_event"
+
 CONF_ON_PAIRING_MODE_ON = "on_pairing_mode_on_action"
 CONF_ON_PAIRING_MODE_OFF = "on_pairing_mode_off_action"
 CONF_ON_PAIRED = "on_paired_action"
@@ -233,6 +254,11 @@ NukiLockComponent = nuki_lock_ns.class_('NukiLockComponent', lock.Lock, cg.Compo
 # Buttons
 NukiLockUnpairButton = nuki_lock_ns.class_("NukiLockUnpairButton", button.Button, cg.Component)
 NukiLockRequestCalibrationButton = nuki_lock_ns.class_("NukiLockRequestCalibrationButton", button.Button, cg.Component)
+NukiLockPairBridgeButton = nuki_lock_ns.class_("NukiLockPairBridgeButton", button.Button, cg.Component)
+NukiLockPairLockButton = nuki_lock_ns.class_("NukiLockPairLockButton", button.Button, cg.Component)
+
+# Bridge
+NukiBridge = nuki_lock_ns.class_("NukiBridge")
 
 # Switches
 NukiLockPairingModeSwitch = nuki_lock_ns.class_("NukiLockPairingModeSwitch", switch.Switch, cg.Component)
@@ -256,6 +282,7 @@ NukiLockDetachedCylinderEnabledSwitch = nuki_lock_ns.class_("NukiLockDetachedCyl
 NukiLockLoggingEnabledSwitch = nuki_lock_ns.class_("NukiLockLoggingEnabledSwitch", switch.Switch, cg.Component)
 
 # Number Inputs
+NukiLockSecurityPinText = nuki_lock_ns.class_("NukiLockSecurityPinText", text.Text, cg.Component)
 NukiLockLedBrightnessNumber = nuki_lock_ns.class_("NukiLockLedBrightnessNumber", number.Number, cg.Component)
 NukiLockTimeZoneOffsetNumber = nuki_lock_ns.class_("NukiLockTimeZoneOffsetNumber", number.Number, cg.Component)
 NukiLockLockNGoTimeoutNumber = nuki_lock_ns.class_("NukiLockLockNGoTimeoutNumber", number.Number, cg.Component)
@@ -377,6 +404,13 @@ CONFIG_SCHEMA = cv.All(
                 entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
                 icon="mdi:door-open",
             ),
+            cv.Optional(CONF_LOCK_STATE_TEXT_SENSOR): text_sensor.text_sensor_schema(
+                icon="mdi:lock-question",
+            ),
+            cv.Optional(CONF_BLUETOOTH_STATUS_TEXT_SENSOR): text_sensor.text_sensor_schema(
+                entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+                icon="mdi:bluetooth-connect",
+            ),
             cv.Optional(CONF_LAST_UNLOCK_USER_TEXT_SENSOR):  text_sensor.text_sensor_schema(
                 entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
                 icon="mdi:account-clock"
@@ -428,6 +462,11 @@ CONFIG_SCHEMA = cv.All(
                 unit_of_measurement="mWs",
                 icon="mdi:battery-arrow-down-outline",
             ),
+            cv.Optional(CONF_LOCK_DISTANCE_SENSOR): sensor.sensor_schema(
+                entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+                unit_of_measurement=UNIT_DEGREES,
+                icon="mdi:rotate-right",
+            ),
             cv.Optional(CONF_MOTOR_CURRENT_SENSOR): sensor.sensor_schema(
                 device_class=DEVICE_CLASS_CURRENT,
                 entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
@@ -458,6 +497,16 @@ CONFIG_SCHEMA = cv.All(
                 NukiLockRequestCalibrationButton,
                 entity_category=ENTITY_CATEGORY_CONFIG,
                 icon="mdi:progress-wrench",
+            ),
+            cv.Optional(CONF_PAIR_BRIDGE_BUTTON): button.button_schema(
+                NukiLockPairBridgeButton,
+                entity_category=ENTITY_CATEGORY_CONFIG,
+                icon="mdi:cloud-plus",
+            ),
+            cv.Optional(CONF_PAIR_LOCK_BUTTON): button.button_schema(
+                NukiLockPairLockButton,
+                entity_category=ENTITY_CATEGORY_CONFIG,
+                icon="mdi:bluetooth-connect",
             ),
             cv.Optional(CONF_PAIRING_MODE_SWITCH): switch.switch_schema(
                 NukiLockPairingModeSwitch,
@@ -572,6 +621,12 @@ CONFIG_SCHEMA = cv.All(
                 device_class=DEVICE_CLASS_SWITCH,
                 entity_category=ENTITY_CATEGORY_CONFIG,
                 icon="mdi:math-log",
+            ),
+            cv.Optional(CONF_SECURITY_PIN_TEXT): text.text_schema(
+                NukiLockSecurityPinText,
+                entity_category=ENTITY_CATEGORY_CONFIG,
+                icon="mdi:shield-key",
+                mode="PASSWORD",
             ),
             cv.Optional(CONF_LED_BRIGHTNESS_NUMBER): number.number_schema(
                 NukiLockLedBrightnessNumber,
@@ -736,6 +791,25 @@ CONFIG_SCHEMA = cv.All(
                     }
                 ),
                 cv.requires_component("mqtt"),
+            ),
+            cv.Optional(CONF_BRIDGE): cv.Schema(
+                {
+                    cv.GenerateID(): cv.declare_id(NukiBridge),
+                    cv.Optional(CONF_HOST_INDEX, default=0): cv.int_range(min=0, max=50),
+                    cv.Optional(CONF_WS_TOKEN, default=""): cv.string,
+                    cv.Optional(CONF_BRIDGE_ID, default=0): cv.uint32_t,
+                    cv.Optional(CONF_NUKI_ID, default=0): cv.uint32_t,
+                    cv.Optional(CONF_DEVICE_TYPE, default=4): cv.uint8_t,
+                    cv.Optional(CONF_CLOUD_STATUS): text_sensor.text_sensor_schema(
+                        entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+                        icon="mdi:cloud-sync",
+                    ),
+                    cv.Optional(CONF_CLOUD_EVENT): event.event_schema(
+                        event.Event,
+                        entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+                        icon="mdi:bell-ring-outline",
+                    ),
+                }
             ),
             cv.Optional(CONF_ON_PAIRING_MODE_ON): automation.validate_automation(
                 {
@@ -920,6 +994,10 @@ async def to_code(config):
         sens = await sensor.new_sensor(battery_drain)
         cg.add(var.set_battery_drain_sensor(sens))
 
+    if lock_distance := config.get(CONF_LOCK_DISTANCE_SENSOR):
+        sens = await sensor.new_sensor(lock_distance)
+        cg.add(var.set_lock_distance_sensor(sens))
+
     if motor_current := config.get(CONF_MOTOR_CURRENT_SENSOR):
         sens = await sensor.new_sensor(motor_current)
         cg.add(var.set_motor_current_sensor(sens))
@@ -933,9 +1011,17 @@ async def to_code(config):
         cg.add(var.set_wifi_connection_strength_sensor(sens))
 
     # Text Sensor
+    if bluetooth_status := config.get(CONF_BLUETOOTH_STATUS_TEXT_SENSOR):
+        sens = await text_sensor.new_text_sensor(bluetooth_status)
+        cg.add(var.set_bluetooth_status_text_sensor(sens))
+
     if door_sensor_state := config.get(CONF_DOOR_SENSOR_STATE_TEXT_SENSOR):
         sens = await text_sensor.new_text_sensor(door_sensor_state)
         cg.add(var.set_door_sensor_state_text_sensor(sens))
+
+    if lock_state := config.get(CONF_LOCK_STATE_TEXT_SENSOR):
+        sens = await text_sensor.new_text_sensor(lock_state)
+        cg.add(var.set_lock_state_text_sensor(sens))
 
     if last_unlock_user := config.get(CONF_LAST_UNLOCK_USER_TEXT_SENSOR):
         sens = await text_sensor.new_text_sensor(last_unlock_user)
@@ -976,7 +1062,22 @@ async def to_code(config):
         await cg.register_parented(b, config[CONF_ID])
         cg.add(var.set_request_calibration_button(b))
 
+    if pair_bridge := config.get(CONF_PAIR_BRIDGE_BUTTON):
+        b = await button.new_button(pair_bridge)
+        await cg.register_parented(b, config[CONF_ID])
+        cg.add(var.set_pair_bridge_button(b))
+
+    if pair_lock := config.get(CONF_PAIR_LOCK_BUTTON):
+        b = await button.new_button(pair_lock)
+        await cg.register_parented(b, config[CONF_ID])
+        cg.add(var.set_pair_lock_button(b))
+
     # Number
+    if security_pin_text := config.get(CONF_SECURITY_PIN_TEXT):
+        t = await text.new_text(security_pin_text, min_length=0, max_length=6, pattern="[0-9]*")
+        await cg.register_parented(t, config[CONF_ID])
+        cg.add(var.set_security_pin_text(t))
+
     if led_brightness := config.get(CONF_LED_BRIGHTNESS_NUMBER):
         n = await number.new_number(
             led_brightness, min_value=0, max_value=5, step=1
@@ -1007,7 +1108,7 @@ async def to_code(config):
 
     if unlatch_duration := config.get(CONF_UNLATCH_DURATION_NUMBER):
         n = await number.new_number(
-            unlatch_duration, min_value=5, max_value=60, step=1
+            unlatch_duration, min_value=1, max_value=30, step=1
         )
         await cg.register_parented(n, config[CONF_ID])
         cg.add(var.set_unlatch_duration_number(n))
@@ -1226,6 +1327,41 @@ async def to_code(config):
         trigger = cg.new_Pvariable(conf[CONF_TRIGGER_ID], var)
         await automation.build_automation(trigger, [(LogEntry, "x")], conf)
 
+    # Bridge
+    if bridge_conf := config.get(CONF_BRIDGE):
+        bridge_var = cg.new_Pvariable(
+            bridge_conf[CONF_ID],
+            var,
+            f"{config[CONF_ID].id[:5]}_br",
+        )
+        if ws_token := bridge_conf.get(CONF_WS_TOKEN):
+            cg.add(bridge_var.set_ws_token(ws_token))
+        if host_index := bridge_conf.get(CONF_HOST_INDEX):
+            cg.add(bridge_var.set_host_index(host_index))
+        if bridge_id := bridge_conf.get(CONF_BRIDGE_ID):
+            cg.add(bridge_var.set_bridge_id(bridge_id))
+        if nuki_id := bridge_conf.get(CONF_NUKI_ID):
+            cg.add(bridge_var.set_nuki_id(nuki_id))
+        cg.add(bridge_var.set_device_type(bridge_conf[CONF_DEVICE_TYPE]))
+        if cloud_status := bridge_conf.get(CONF_CLOUD_STATUS):
+            sens = await text_sensor.new_text_sensor(cloud_status)
+            cg.add(bridge_var.set_cloud_status_sensor(sens))
+        if cloud_event := bridge_conf.get(CONF_CLOUD_EVENT):
+            ev = await event.new_event(
+                cloud_event,
+                event_types=[
+                    "connected",
+                    "disconnected",
+                    "bridge_id_received",
+                    "keyturner_request",
+                    "keyturner_response",
+                    "keyturner_event",
+                    "error",
+                ],
+            )
+            cg.add(bridge_var.set_cloud_event(ev))
+        cg.add(var.set_bridge(bridge_var))
+
     # Libraries
     if arduino_bundles_libsodium():
         # arduino-esp32 (below IDF 6.0) ships espressif/libsodium, and ESPHome's
@@ -1259,6 +1395,13 @@ async def to_code(config):
         name="crc16",
         repo="https://github.com/AzonInc/Crc16.git",
     )
+    add_idf_component(
+        name="espressif/esp_websocket_client",
+        ref="^1.2.0",
+    )
+    # The bridge's websocket runs over esp-tls, which ESPHome compiles out unless asked for
+    request_tls()
+    require_full_certificate_bundle()
     # NukiBleEsp32 (lock-only subset, Opener files excluded) is vendored directly as
     # component sources instead of a fetched IDF component, see nuki_ble.cpp/.h,
     # nuki_lock_protocol.cpp/.h etc. in this directory. It now talks to the lock via

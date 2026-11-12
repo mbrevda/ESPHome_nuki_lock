@@ -165,7 +165,7 @@ lock:
     pairing_mode:
       name: "Pairing Mode"
   # Binary Sensors
-    connected:
+    connected:                 # off after 30s of unanswered requests or a stuck connection
       name: "Connected"
     paired:
       name: "Paired"
@@ -734,6 +734,14 @@ All entities are optional, add the ones you need under the `lock:` block with a 
 | `single_locked_position_offset` | Number | Calibration: single locked position offset |
 | `unlocked_to_locked_transition_offset` | Number | Calibration: unlocked to locked transition offset |
 | `request_calibration` | Button | Start a calibration |
+
+---
+
+# 🌉 Cloud Bridge (Experimental)
+The component can stand in for a Nuki Bridge: it registers with the Nuki cloud and relays app commands to the lock over BLE, so the Nuki app works away from home. The cloud protocol was worked out from observation, so parts of it are still guesses.
+
+## Not Implemented Yet
+- **Firmware updates.** Once a day the bridge asks the cloud whether the lock has newer firmware and only logs the answer. Nothing is downloaded or installed, and the bridge does not report a firmware version of its own. Still to learn: the reply format, how images are downloaded (packet by packet, with resume), how they are sent to the lock over BLE, and whether keypads, fobs and door sensors are updated through the bridge. Downloaded images should be cached until applied so they are not fetched again.
 
 ---
 

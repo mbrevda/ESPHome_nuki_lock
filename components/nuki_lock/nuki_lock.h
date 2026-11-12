@@ -29,6 +29,9 @@
 #ifdef USE_NUMBER
 #include "esphome/components/number/number.h"
 #endif
+#ifdef USE_TEXT
+#include "esphome/components/text/text.h"
+#endif
 #ifdef USE_SELECT
 #include "esphome/components/select/select.h"
 #endif
@@ -37,6 +40,7 @@
 #include "nuki_ble_constants.h"
 
 #include "nuki_lock_utils.h"
+#include "nuki_bridge.h"
 
 namespace esphome::nuki_lock {
 
@@ -94,11 +98,14 @@ class NukiLockComponent :
     SUB_SENSOR(battery_voltage)
     SUB_SENSOR(battery_drain)
     SUB_SENSOR(motor_current)
+    SUB_SENSOR(lock_distance)
     SUB_SENSOR(bt_signal)
     SUB_SENSOR(wifi_connection_strength)
     #endif
     #ifdef USE_TEXT_SENSOR
+    SUB_TEXT_SENSOR(bluetooth_status)
     SUB_TEXT_SENSOR(door_sensor_state)
+    SUB_TEXT_SENSOR(lock_state)
     SUB_TEXT_SENSOR(last_unlock_user)
     SUB_TEXT_SENSOR(last_lock_action)
     SUB_TEXT_SENSOR(last_lock_action_trigger)
@@ -118,6 +125,12 @@ class NukiLockComponent :
     SUB_NUMBER(single_locked_position_offset)
     SUB_NUMBER(unlocked_to_locked_transition_offset)
     #endif
+    #ifdef USE_TEXT
+    protected:
+        text::Text *security_pin_text_{nullptr};
+    public:
+        void set_security_pin_text(text::Text *t) { this->security_pin_text_ = t; }
+    #endif
     #ifdef USE_SELECT
     SUB_SELECT(single_button_press_action)
     SUB_SELECT(double_button_press_action)
@@ -132,6 +145,8 @@ class NukiLockComponent :
     #ifdef USE_BUTTON
     SUB_BUTTON(unpair)
     SUB_BUTTON(request_calibration)
+    SUB_BUTTON(pair_bridge)
+    SUB_BUTTON(pair_lock)
     #endif
     #ifdef USE_SWITCH
     SUB_SWITCH(pairing_mode)
@@ -208,6 +223,7 @@ class NukiLockComponent :
             }
         }
         void set_security_pin(uint32_t security_pin);
+        void publish_security_pin();
         void set_pairing_mode(bool enabled);
 
 #ifdef USE_NUKI_LOCK_HYBRID
@@ -252,6 +268,8 @@ class NukiLockComponent :
 
         bool is_connected() { return this->connected_; }
         bool is_paired() { return this->nuki_lock_.is_paired_with_lock(); }
+        std::string get_bluetooth_status();
+        void publish_bluetooth_status();
 
         void lock_n_go();
         void print_keypad_entries();
@@ -270,6 +288,23 @@ class NukiLockComponent :
         Config* get_nuki_lock_config() { return &this->nuki_lock_config_; }
         AdvancedConfig* get_nuki_lock_advanced_config() { return &this->nuki_lock_advanced_config_; }
 
+        // ── Bridge Integration ──
+        uint32_t get_lock_nuki_id() const { return this->nuki_lock_config_.nukiId; }
+        bool can_relay() const {
+            // Indications are routed by authorization id, so a relay may share the link with
+            // one of our own commands.
+            // ... except a door report: the lock didn't answer either while one hung.
+            return this->nuki_lock_.can_start_relay() && !this->door_report_in_flight_;
+        }
+        bool execute_relay_command(const uint8_t *data, size_t len, std::function<void(bool ok, const uint8_t *resp, size_t resplen)> callback) {
+            return this->nuki_lock_.start_relay(data, len, callback);
+        }
+        void set_bridge(NukiBridge *bridge) { this->bridge_.reset(bridge); }
+        NukiBridge *get_bridge() { return this->bridge_.get(); }
+        void register_bridge() {
+            if (this->bridge_) this->bridge_->start_registration();
+        }
+
         // Queues a Nuki command (typically a `nuki_lock_.setXxx(...)` call) to run on the
         // single in-flight Nuki BLE command slot. `command` is called repeatedly, once per
         // loop() tick, until it returns something other than CmdResult::Working; a non-
@@ -278,6 +313,9 @@ class NukiLockComponent :
         // Only one queued command (and at most one other Nuki operation: a lock action,
         // status/config poll, etc.) can be in flight at a time - see nuki_op_active_ in loop().
         void queue_nuki_command(std::function<CmdResult()> command, std::function<void(CmdResult)> on_done);
+        // After a settings write, read the config back so entities show what the lock kept.
+        void request_config_read() { this->config_update_ = true; }
+        void request_advanced_config_read() { this->advanced_config_update_ = true; }
 
     protected:
         CallbackManager<void()> pairing_mode_on_callback_;
@@ -337,6 +375,11 @@ class NukiLockComponent :
         void update_auth_data();
         void update_battery_report();
         void report_door_sensor_step();
+        // The door state to report next, if any (open is set to it), and whether it is due now
+        bool door_report_next(bool *open);
+        bool door_report_due();
+        bool door_report_held(bool open);
+        void publish_lock_reachable();
         void validate_pin();
         void validate_pin_step();
         void execute_lock_action_step();
@@ -351,6 +394,7 @@ class NukiLockComponent :
         // executing_lock_action_, for the same reason - see set_lock_action_options().
         uint8_t executing_lock_action_flags_{0};
         std::string executing_lock_action_name_suffix_;
+        std::string last_published_bt_status_{};
 
         // Publishes the transitional lock state assumed while a lock action is executing
         void publish_assumed_lock_state(LockAction action);
@@ -432,12 +476,25 @@ class NukiLockComponent :
 #ifdef USE_BINARY_SENSOR
         binary_sensor::BinarySensor* door_sensor_input_{nullptr};
 #endif
-        // Set by door_sensor_input_'s state callback: latest door state not reported yet
-        bool door_sensor_report_pending_{false};
+        // Latest door state, set by door_sensor_input_'s state callback
         bool door_sensor_report_open_{false};
-        // Snapshot of door_sensor_report_open_ for the report in flight, so a change during
-        // it is reported afterwards instead of altering the command being sent
+        // The door state the lock was last told (or showed in a status read); unset at boot
+        optional<bool> door_report_lock_open_{};
+        // The door opened since the lock last accepted OPEN: the lock re-latches on that
+        // transition, so OPEN is sent before any later CLOSED
+        bool door_report_open_owed_{false};
+        // Snapshot of the state for the report in flight, so a change during it is
+        // reported afterwards instead of altering the command being sent
         bool door_sensor_report_sending_open_{false};
+        bool door_report_in_flight_{false};
+        uint8_t door_report_retries_used_{0};
+        uint32_t door_report_retry_at_{0};
+        uint32_t door_report_held_since_{0};
+        uint32_t door_report_accepted_at_{0};
+        uint32_t door_report_failing_since_{0};
+        uint32_t nuki_op_started_at_{0};
+        LockState last_lock_state_{LockState::Undefined};
+        std::unique_ptr<NukiBridge> bridge_{nullptr};
 
         // Action flags
         bool open_latch_{false};
@@ -496,6 +553,20 @@ class NukiLockUnpairButton : public button::Button, public Parented<NukiLockComp
 class NukiLockRequestCalibrationButton : public button::Button, public Parented<NukiLockComponent> {
     public:
         NukiLockRequestCalibrationButton() = default;
+    protected:
+        void press_action() override;
+};
+
+class NukiLockPairBridgeButton : public button::Button, public Parented<NukiLockComponent> {
+    public:
+        NukiLockPairBridgeButton() = default;
+    protected:
+        void press_action() override;
+};
+
+class NukiLockPairLockButton : public button::Button, public Parented<NukiLockComponent> {
+    public:
+        NukiLockPairLockButton() = default;
     protected:
         void press_action() override;
 };
@@ -715,6 +786,16 @@ class NukiLockLoggingEnabledSwitch : public switch_::Switch, public Parented<Nuk
 
     protected:
         void write_state(bool state) override;
+};
+#endif
+
+#ifdef USE_TEXT
+class NukiLockSecurityPinText : public text::Text, public Parented<NukiLockComponent> {
+    public:
+        NukiLockSecurityPinText() = default;
+
+    protected:
+        void control(const std::string &value) override;
 };
 #endif
 
