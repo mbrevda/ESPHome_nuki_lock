@@ -246,6 +246,8 @@ CONF_CLOUD_EVENT = "cloud_event"
 CONF_ON_PAIRING_MODE_ON = "on_pairing_mode_on_action"
 CONF_ON_PAIRING_MODE_OFF = "on_pairing_mode_off_action"
 CONF_ON_PAIRED = "on_paired_action"
+CONF_ON_CONNECTED = "on_connected_action"
+CONF_ON_DISCONNECTED = "on_disconnected_action"
 CONF_ON_EVENT_LOG = "on_event_log_action"
 
 nuki_lock_ns = cg.esphome_ns.namespace('nuki_lock')
@@ -336,6 +338,8 @@ LogEntry = nuki_lock_ns.struct('LogEntry')
 PairingModeOnTrigger = nuki_lock_ns.class_("PairingModeOnTrigger", automation.Trigger.template())
 PairingModeOffTrigger = nuki_lock_ns.class_("PairingModeOffTrigger", automation.Trigger.template())
 PairedTrigger = nuki_lock_ns.class_("PairedTrigger", automation.Trigger.template())
+ConnectedTrigger = nuki_lock_ns.class_("ConnectedTrigger", automation.Trigger.template())
+DisconnectedTrigger = nuki_lock_ns.class_("DisconnectedTrigger", automation.Trigger.template())
 EventLogReceivedTrigger = nuki_lock_ns.class_("EventLogReceivedTrigger", automation.Trigger.template())
 
 # The id is sent to the lock as authorization name, which has a fixed 32 byte field
@@ -824,6 +828,16 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_ON_PAIRED): automation.validate_automation(
                 {
                     cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(PairedTrigger),
+                }
+            ),
+            cv.Optional(CONF_ON_CONNECTED): automation.validate_automation(
+                {
+                    cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(ConnectedTrigger),
+                }
+            ),
+            cv.Optional(CONF_ON_DISCONNECTED): automation.validate_automation(
+                {
+                    cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(DisconnectedTrigger),
                 }
             ),
             cv.Optional(CONF_ON_EVENT_LOG): automation.validate_automation(
@@ -1320,6 +1334,14 @@ async def to_code(config):
         await automation.build_automation(trigger, [], conf)
 
     for conf in config.get(CONF_ON_PAIRED, []):
+        trigger = cg.new_Pvariable(conf[CONF_TRIGGER_ID], var)
+        await automation.build_automation(trigger, [], conf)
+
+    for conf in config.get(CONF_ON_CONNECTED, []):
+        trigger = cg.new_Pvariable(conf[CONF_TRIGGER_ID], var)
+        await automation.build_automation(trigger, [], conf)
+
+    for conf in config.get(CONF_ON_DISCONNECTED, []):
         trigger = cg.new_Pvariable(conf[CONF_TRIGGER_ID], var)
         await automation.build_automation(trigger, [], conf)
 

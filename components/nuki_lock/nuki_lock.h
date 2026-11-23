@@ -256,6 +256,16 @@ class NukiLockComponent :
             this->paired_callback_.add(std::forward<F>(callback));
         }
 
+        template<typename F> void add_connected_callback(F &&callback)
+        {
+            this->connected_callback_.add(std::forward<F>(callback));
+        }
+
+        template<typename F> void add_disconnected_callback(F &&callback)
+        {
+            this->disconnected_callback_.add(std::forward<F>(callback));
+        }
+
         template<typename F> void add_event_log_received_callback(F &&callback)
         {
             this->event_log_received_callback_.add(std::forward<F>(callback));
@@ -321,6 +331,10 @@ class NukiLockComponent :
         CallbackManager<void()> pairing_mode_on_callback_;
         CallbackManager<void()> pairing_mode_off_callback_;
         CallbackManager<void()> paired_callback_;
+        CallbackManager<void()> connected_callback_;
+        CallbackManager<void()> disconnected_callback_;
+        // The state the connected sensor and triggers last reported; unset until the first loop
+        optional<bool> connected_reported_{};
         CallbackManager<void(LogEntry)> event_log_received_callback_;
 
         void control(const lock::LockCall &call) override;

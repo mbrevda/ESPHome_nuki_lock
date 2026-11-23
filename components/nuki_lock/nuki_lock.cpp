@@ -708,7 +708,6 @@ bool NukiLockComponent::door_report_held(bool open) {
 }
 
 void NukiLockComponent::publish_lock_reachable() {
-#ifdef USE_BINARY_SENSOR
     // Unreachable once the lock has left requests unanswered, or an operation has been
     // stuck (e.g. never connecting), for this long.
     static const uint32_t UNREACHABLE_AFTER_MS = 30000;
@@ -717,14 +716,44 @@ void NukiLockComponent::publish_lock_reachable() {
     bool unanswered = since != 0 && now - since > UNREACHABLE_AFTER_MS;
     bool stuck = this->nuki_op_started_at_ != 0 && now - this->nuki_op_started_at_ > UNREACHABLE_AFTER_MS;
     bool reachable = !unanswered && !stuck;
-    if (this->connected_binary_sensor_ != nullptr &&
-        (!this->connected_binary_sensor_->has_state() || this->connected_binary_sensor_->state != reachable)) {
-        if (!reachable) {
-            ESP_LOGW(TAG, "Lock unreachable for %" PRIu32 "s", UNREACHABLE_AFTER_MS / 1000);
-        }
-        this->connected_binary_sensor_->publish_state(reachable);
+
+    bool paired = this->is_paired();
+    bool connected = paired && reachable;
+    bool changed = !this->connected_reported_.has_value() || *this->connected_reported_ != connected;
+
+    if (changed && paired && !reachable) {
+        ESP_LOGW(TAG, "Lock unreachable for %" PRIu32 "s", UNREACHABLE_AFTER_MS / 1000);
     }
-#endif
+
+    #ifdef USE_BINARY_SENSOR
+    if (this->connected_binary_sensor_ != nullptr &&
+        (!this->connected_binary_sensor_->has_state() || this->connected_binary_sensor_->state != connected)) {
+        this->connected_binary_sensor_->publish_state(connected);
+    }
+    #endif
+
+    // No triggers while unpaired (on_paired_action covers pairing). The first state after
+    // boot or pairing is set without one either: before the lock has answered, "connected"
+    // only means nothing has failed yet. If it never answers, disconnected fires 30s later.
+    if (!paired) {
+        this->connected_reported_.reset();
+        return;
+    }
+    if (!changed) {
+        return;
+    }
+    bool initial = !this->connected_reported_.has_value();
+    this->connected_reported_ = connected;
+    if (initial) {
+        return;
+    }
+    if (connected) {
+        ESP_LOGI(TAG, "Lock connected");
+        this->connected_callback_.call();
+    } else {
+        ESP_LOGI(TAG, "Lock disconnected");
+        this->disconnected_callback_.call();
+    }
 }
 
 void NukiLockComponent::update_event_logs() {
@@ -1027,13 +1056,6 @@ void NukiLockComponent::execute_lock_action_step() {
 
             // Publish failed state only when no attempts are left
             this->publish_state(lock::LOCK_STATE_NONE);
-
-            #ifdef USE_BINARY_SENSOR
-            if (this->connected_binary_sensor_ != nullptr)
-            {
-                this->connected_binary_sensor_->publish_state(this->connected_);
-            }
-            #endif
         }
     }
 
@@ -1386,9 +1408,6 @@ void NukiLockComponent::loop()
         #ifdef USE_BINARY_SENSOR
         if (this->paired_binary_sensor_ != nullptr) {
             this->paired_binary_sensor_->publish_state(false);
-        }
-        if (this->connected_binary_sensor_ != nullptr) {
-            this->connected_binary_sensor_->publish_state(connected_);
         }
         #endif
 
